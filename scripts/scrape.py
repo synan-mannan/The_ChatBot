@@ -158,6 +158,23 @@ def _is_remote(record: dict[str, Any], location: str, description: str) -> bool:
     return bool(declared is True or re.search(r"\b(remote|worldwide|anywhere)\b", text))
 
 
+def _contact_email(record: dict[str, Any]) -> str | None:
+    for key in (
+        "contact_email",
+        "contactEmail",
+        "applicationEmail",
+        "apply_email",
+        "applyEmail",
+        "email",
+    ):
+        value = record.get(key)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", candidate):
+                return candidate
+    return None
+
+
 def normalize(source: str, record: dict[str, Any]) -> dict[str, Any] | None:
     if source == "arbeitnow":
         title = record.get("title")
@@ -218,6 +235,7 @@ def normalize(source: str, record: dict[str, Any]) -> dict[str, Any] | None:
         "title": title,
         "company": company,
         "location": location,
+        "contact_email": _contact_email(record),
         "is_remote": _is_remote(record, location, description),
         "experience_required": extract_experience(description, str(experience_hint or "")),
         "skills": extract_skills(description, tags),

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import re
+import tempfile
+from pathlib import Path
 
 import httpx
 
@@ -21,6 +25,21 @@ from server.app.services.sessions import SessionStore
 router = APIRouter(prefix="/api", tags=["resume"])
 
 
+def _persist_resume(upload_root: Path, session_id: str, suffix: str, content: bytes) -> Path:
+    directory = upload_root / session_id
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"resume{suffix}"
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".resume-", dir=directory)
+    try:
+        with os.fdopen(descriptor, "wb") as temporary_file:
+            temporary_file.write(content)
+        os.replace(temporary_name, destination)
+    except OSError:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+    return destination
+
+
 @router.post("/upload", response_model=UploadResponse)
 async def upload_resume(
     request: Request,
@@ -28,6 +47,8 @@ async def upload_resume(
     file: UploadFile = File(...),
     session: AsyncSession = Depends(get_database_session),
 ) -> UploadResponse:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", session_id):
+        raise HTTPException(status_code=400, detail="The session ID contains unsupported characters.")
     settings = request.app.state.settings
     content = await file.read(settings.max_resume_bytes + 1)
     try:
@@ -53,6 +74,21 @@ async def upload_resume(
             detail="The AI service is temporarily unavailable after retries. Please try again shortly.",
         ) from exc
 
+    suffix = Path(file.filename or "").suffix.lower()
+    try:
+        resume_path = await asyncio.to_thread(
+            _persist_resume,
+            Path(settings.uploads_dir),
+            session_id,
+            suffix,
+            content,
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="The resume was parsed, but could not be saved for applications.",
+        ) from exc
+
     row = await session.get(ResumeProfileRow, session_id)
     if row is None:
         row = ResumeProfileRow(session_id=session_id, profile_data=profile.model_dump(mode="json"))
@@ -62,4 +98,5 @@ async def upload_resume(
     await session.commit()
     store: SessionStore = request.app.state.session_store
     store.set_profile(session_id, profile)
+    store.get(session_id).resume_path = str(resume_path)
     return UploadResponse(profile=profile)

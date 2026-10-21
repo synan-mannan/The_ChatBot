@@ -8,6 +8,7 @@ from server.app.models.schemas import JobFilters, JobRecommendation, ResumeProfi
 @dataclass
 class SessionState:
     profile: ResumeProfile | None = None
+    resume_path: str | None = None
     filters: JobFilters = field(default_factory=JobFilters)
     last_shown_jobs: list[JobRecommendation] = field(default_factory=list)
 

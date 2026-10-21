@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     jobs_file: str = "data/jobs.json"
     max_resume_bytes: int = 5 * 1024 * 1024
+    uploads_dir: str = "uploads"
     client_dist: str = "client/dist"
     llm_max_retries: int = Field(default=3, ge=1, le=8)
 

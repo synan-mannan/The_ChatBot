@@ -42,6 +42,7 @@ class Job(BaseModel):
     title: str
     company: str
     location: str
+    contact_email: str | None = None
     is_remote: bool
     experience_required: str
     skills: list[str] = Field(default_factory=list)
@@ -105,6 +106,11 @@ class ApplicationActionResponse(BaseModel):
         "not_found",
         "resume_required",
         "clarification_required",
+        "in_progress",
+        "submitted",
+        "dry_run",
+        "needs_manual",
+        "failed",
     ]
     message: str
     job_id: str | None = None

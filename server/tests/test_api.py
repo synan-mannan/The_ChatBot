@@ -88,6 +88,7 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'aijob.db'}",
         jobs_file=str(ROOT / "data" / "jobs.json"),
         client_dist=str(ROOT / "client" / "dist"),
+        uploads_dir=str(tmp_path / "uploads"),
     )
     app = create_app(settings, model)
 
@@ -95,19 +96,23 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
         no_resume = client.get("/api/applications", params={"session_id": session_id})
         assert "upload a resume" in no_resume.json()["message"].lower()
 
+        resume_bytes = make_docx()
         uploaded = client.post(
             "/api/upload",
             data={"session_id": session_id},
             files={
                 "file": (
                     "jordan.docx",
-                    make_docx(),
+                    resume_bytes,
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
             },
         )
         assert uploaded.status_code == 200
         assert uploaded.json()["profile"]["name"] == "Jordan Lee"
+        resume_path = tmp_path / "uploads" / session_id / "resume.docx"
+        assert resume_path.read_bytes() == resume_bytes
+        assert app.state.session_store.get(session_id).resume_path == str(resume_path)
 
         recommended = client.post(
             "/api/chat",
@@ -161,6 +166,7 @@ def test_application_card_endpoint_does_not_call_llm(tmp_path: Path) -> None:
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'apply-direct.db'}",
         jobs_file=str(ROOT / "data" / "jobs.json"),
         client_dist=str(ROOT / "client" / "dist"),
+        uploads_dir=str(tmp_path / "uploads"),
     )
 
     app = create_app(settings, model)
@@ -207,6 +213,7 @@ def test_upload_rejects_unsupported_file_with_friendly_message(tmp_path: Path) -
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'aijob.db'}",
         jobs_file=str(ROOT / "data" / "jobs.json"),
         client_dist=str(ROOT / "client" / "dist"),
+        uploads_dir=str(tmp_path / "uploads"),
     )
     app = create_app(settings, ScriptedModel([]))
 
@@ -227,6 +234,7 @@ def test_resume_profile_is_restored_from_database_after_restart(tmp_path: Path) 
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'persistent.db'}",
         jobs_file=str(ROOT / "data" / "jobs.json"),
         client_dist=str(ROOT / "client" / "dist"),
+        uploads_dir=str(tmp_path / "uploads"),
     )
     upload_model = ScriptedModel([])
     with TestClient(create_app(settings, upload_model)) as client:

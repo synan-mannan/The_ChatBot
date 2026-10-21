@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
-from sqlalchemy import DateTime, Integer, JSON, String, UniqueConstraint, func
+from sqlalchemy import (
+    DateTime,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    inspect,
+    text,
+)
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -39,7 +49,16 @@ class ApplicationRow(Base):
     applied_date: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
-    status: Mapped[str] = mapped_column(String(32), default="applied", nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), default="applied", server_default="applied", nullable=False
+    )
+    method: Mapped[str] = mapped_column(
+        String(32), default="manual", server_default="manual", nullable=False
+    )
+    detail: Mapped[str] = mapped_column(
+        Text, default="", server_default="", nullable=False
+    )
+    apply_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
 
 
 def _async_database_url(url: str) -> str:
@@ -59,6 +78,31 @@ def create_database(url: str | None = None) -> tuple[AsyncEngine, async_sessionm
 async def initialize_database(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        await connection.run_sync(_migrate_application_columns)
+
+
+def _migrate_application_columns(connection: Any) -> None:
+    inspector = inspect(connection)
+    if "applications" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("applications")}
+    additions = {
+        "method": "VARCHAR(32) NOT NULL DEFAULT 'manual'",
+        "detail": "TEXT NOT NULL DEFAULT ''",
+        "apply_url": "VARCHAR(2048)",
+    }
+    for name, definition in additions.items():
+        if name not in columns:
+            connection.exec_driver_sql(
+                f"ALTER TABLE applications ADD COLUMN {name} {definition}"
+            )
+    connection.execute(
+        text(
+            "UPDATE applications SET status = 'dry_run', detail = "
+            "CASE WHEN detail = '' THEN 'Legacy application record; submission was not verified.' "
+            "ELSE detail END WHERE status = 'applied'"
+        )
+    )
 
 
 async def get_db_session(
