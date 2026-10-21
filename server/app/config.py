@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,7 +19,7 @@ class Settings(BaseSettings):
     jobs_file: str = "data/jobs.json"
     max_resume_bytes: int = 5 * 1024 * 1024
     client_dist: str = "client/dist"
-    llm_max_retries: int = 3
+    llm_max_retries: int = Field(default=3, ge=1, le=8)
 
 
 @lru_cache
