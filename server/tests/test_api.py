@@ -132,6 +132,7 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
         )
         assert applied.status_code == 200
         assert applied.json()["reply"].startswith("I can open the employer's page")
+        assert applied.json()["application_confirmation"]["job_id"] == second_job_id
         assert "yes, submit" in applied.json()["reply"]
         assert "2. " in model.system_instructions[1]
         assert client.get(
@@ -144,6 +145,7 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
         )
         assert submitted.status_code == 200
         assert "not submitted" in submitted.json()["reply"].lower()
+        assert submitted.json()["application_result"]["status"] == "needs_manual"
         assert recommended.json()["jobs"][1]["job"]["source_link"] in submitted.json()["reply"]
 
         listed = client.post(

@@ -69,38 +69,11 @@ class ApplicationView(BaseModel):
     apply_url: str | None = None
 
 
-class ToolCall(BaseModel):
-    name: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
-
-
-class ChatRequest(BaseModel):
-    session_id: SessionId
-    message: Annotated[str, StringConstraints(min_length=1, max_length=4_000, strip_whitespace=True)]
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    tool_calls: list[ToolCall] = Field(default_factory=list)
-    jobs: list[JobRecommendation] | None = None
-    applications: list[ApplicationView] | None = None
-    profile: ResumeProfile | None = None
-
-
-class UploadResponse(BaseModel):
-    profile: ResumeProfile
-    message: str = "Resume parsed successfully."
-
-
-class ApplicationsResponse(BaseModel):
-    applications: list[ApplicationView] = Field(default_factory=list)
-    message: str | None = None
-
-
-class ApplicationActionRequest(BaseModel):
-    session_id: SessionId
-    job_id: Annotated[str, StringConstraints(min_length=1, max_length=128, strip_whitespace=True)]
-    confirm: bool = False
+class ApplicationConfirmation(BaseModel):
+    job_id: str
+    title: str
+    company: str
+    plan: str
 
 
 class ApplicationActionResponse(BaseModel):
@@ -126,3 +99,39 @@ class ApplicationActionResponse(BaseModel):
     applied_date: datetime | None = None
     apply_url: str | None = None
     application_status: str | None = None
+
+
+class ToolCall(BaseModel):
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatRequest(BaseModel):
+    session_id: SessionId
+    message: Annotated[str, StringConstraints(min_length=1, max_length=4_000, strip_whitespace=True)]
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    jobs: list[JobRecommendation] | None = None
+    applications: list[ApplicationView] | None = None
+    application_confirmation: ApplicationConfirmation | None = None
+    application_result: ApplicationActionResponse | None = None
+    profile: ResumeProfile | None = None
+
+
+class UploadResponse(BaseModel):
+    profile: ResumeProfile
+    message: str = "Resume parsed successfully."
+
+
+class ApplicationsResponse(BaseModel):
+    applications: list[ApplicationView] = Field(default_factory=list)
+    message: str | None = None
+
+
+class ApplicationActionRequest(BaseModel):
+    session_id: SessionId
+    job_id: Annotated[str, StringConstraints(min_length=1, max_length=128, strip_whitespace=True)]
+    confirm: bool = False

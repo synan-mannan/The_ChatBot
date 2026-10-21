@@ -20,6 +20,14 @@ const TOOL_LABELS = {
   apply_to_job: "Application recorded",
   list_applications: "Application history"
 };
+const APPLICATION_STATUS_LABELS = {
+  submitted: "Submitted",
+  dry_run: "Dry run",
+  needs_manual: "Needs manual action",
+  failed: "Failed",
+  in_progress: "In progress",
+  duplicate: "Already recorded"
+};
 
 async function responseJson(response) {
   const payload = await response.json().catch(() => ({}));
@@ -114,11 +122,61 @@ function ApplicationList({ applications }) {
           <div>
             <strong>{application.title}</strong>
             <span>{application.company} · {new Date(application.applied_date).toLocaleDateString()}</span>
+            {application.method && <span>Method: {application.method}</span>}
+            {application.detail && <p className="application-detail">{application.detail}</p>}
+            {application.apply_url && (
+              <a className="application-link" href={application.apply_url} target="_blank" rel="noreferrer">
+                Open application page ↗
+              </a>
+            )}
           </div>
-          <span className="status-pill">{application.status}</span>
+          <ApplicationStatus status={application.status} />
         </div>
       ))}
     </div>
+  );
+}
+
+function ApplicationStatus({ status }) {
+  return (
+    <span className={`status-pill status-${status}`}>
+      {APPLICATION_STATUS_LABELS[status] || status}
+    </span>
+  );
+}
+
+function ApplicationOutcome({ result }) {
+  return (
+    <section className="application-outcome" aria-label="Application result">
+      <div className="application-outcome-heading">
+        <strong>{result.title} {result.company ? `· ${result.company}` : ""}</strong>
+        <ApplicationStatus status={result.status} />
+      </div>
+      {result.detail && <p>{result.detail}</p>}
+      {result.apply_url && (
+        <a className="application-link" href={result.apply_url} target="_blank" rel="noreferrer">
+          Open application page ↗
+        </a>
+      )}
+    </section>
+  );
+}
+
+function ApplicationConfirmation({ confirmation, onConfirm, onCancel }) {
+  return (
+    <section className="application-confirmation" aria-label="Confirm application">
+      <p><strong>{confirmation.title}</strong> · {confirmation.company}</p>
+      <p>Plan: {confirmation.plan}.</p>
+      <p>Nothing will be sent until you confirm.</p>
+      <div className="job-actions">
+        <button className="button button-small" onClick={() => onConfirm(confirmation.job_id)}>
+          Yes, submit
+        </button>
+        <button className="button button-small button-secondary" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -135,7 +193,7 @@ function ToolChips({ tools }) {
   );
 }
 
-function Message({ message, onApply }) {
+function Message({ message, onApply, onConfirm, onCancel }) {
   const isUser = message.role === "user";
   return (
     <div className={`message-row ${isUser ? "message-user" : "message-assistant"}`}>
@@ -150,6 +208,16 @@ function Message({ message, onApply }) {
         {!isUser && message.profile && <ProfileCard profile={message.profile} />}
         {!isUser && <JobCards jobs={message.jobs} onApply={onApply} />}
         {!isUser && message.applications && <ApplicationList applications={message.applications} />}
+        {!isUser && message.applicationConfirmation && (
+          <ApplicationConfirmation
+            confirmation={message.applicationConfirmation}
+            onConfirm={onConfirm}
+            onCancel={onCancel}
+          />
+        )}
+        {!isUser && message.applicationResult && (
+          <ApplicationOutcome result={message.applicationResult} />
+        )}
       </div>
     </div>
   );
@@ -200,7 +268,9 @@ function App() {
           toolCalls: payload.tool_calls || [],
           jobs: payload.jobs,
           profile: profileAlreadyShown ? undefined : payload.profile,
-          applications: payload.applications
+          applications: payload.applications,
+          applicationConfirmation: payload.application_confirmation,
+          applicationResult: payload.application_result
         }];
       });
     } catch (requestError) {
@@ -249,7 +319,7 @@ function App() {
     }
   }
 
-  async function applyToJob(jobId) {
+  async function applyToJob(jobId, confirm = false) {
     if (busy) return;
     setError("");
     setBusy(true);
@@ -257,14 +327,17 @@ function App() {
       const response = await fetch("/api/applications/apply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: SESSION_ID, job_id: jobId })
+        body: JSON.stringify({ session_id: SESSION_ID, job_id: jobId, confirm })
       });
       const payload = await responseJson(response);
       setMessages((current) => [...current, {
         id: crypto.randomUUID(),
         role: "assistant",
         content: payload.message,
-        toolCalls: [{ name: "apply_to_job" }]
+        toolCalls: [{ name: "apply_to_job" }],
+        applicationConfirmation: payload.status === "confirmation_required" ? payload : undefined,
+        applicationResult: ["submitted", "dry_run", "needs_manual", "failed", "duplicate"]
+          .includes(payload.status) ? payload : undefined
       }]);
     } catch (requestError) {
       setError(requestError.message);
@@ -310,7 +383,13 @@ function App() {
         <div className="conversation">
           <div className="date-divider"><span>YOUR JOB SEARCH STARTS HERE</span></div>
           {messages.map((message) => (
-            <Message key={message.id} message={message} onApply={applyToJob} />
+            <Message
+              key={message.id}
+              message={message}
+              onApply={applyToJob}
+              onConfirm={(jobId) => applyToJob(jobId, true)}
+              onCancel={() => sendMessage("cancel")}
+            />
           ))}
           {busy && (
             <div className="message-row message-assistant typing-row">

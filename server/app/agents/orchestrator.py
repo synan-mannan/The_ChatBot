@@ -7,6 +7,8 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.app.models.schemas import (
+    ApplicationActionResponse,
+    ApplicationConfirmation,
     ApplicationView,
     ChatResponse,
     Job,
@@ -40,7 +42,9 @@ For requests to apply to a numbered job, call apply_to_job and use the matching 
 most recent recommendations (for example, job 2 means displayed:2). Use an explicit id:N only when
 the user clearly provides a dataset job ID. Do not ask for clarification when the numbered position
 exists in the recent recommendations.
-Use apply_to_job's two-step confirmation before using an email or ATS application method.
+For applications, call apply_to_job first with confirm=false. Only call it again with confirm=true
+after the user explicitly agrees in a later message containing a clear affirmative confirmation.
+Never infer agreement from the original request to apply.
 For filters, preserve earlier active filters unless the user asks to remove or replace them.
 An application is submitted only when apply_to_job returns status submitted. For dry_run, say it
 was a test run and nothing was sent. For needs_manual, provide the apply link and say it was not
@@ -162,6 +166,8 @@ class Orchestrator:
         calls_for_response: list[ToolCall] = []
         displayed_jobs: list[JobRecommendation] | None = None
         applications: list[ApplicationView] | None = None
+        application_confirmation: ApplicationConfirmation | None = None
+        application_result: ApplicationActionResponse | None = None
         profile = state.profile
         reply = ""
         terminal_tool_result = False
@@ -227,6 +233,17 @@ class Orchestrator:
                         for item in tool_output["applications"]
                     ]
                 if call.name == "apply_to_job":
+                    if tool_output.get("status") not in {
+                        "invalid_arguments",
+                        "unknown_tool",
+                    }:
+                        application_result = ApplicationActionResponse.model_validate(
+                            tool_output
+                        )
+                        if tool_output.get("status") == "confirmation_required":
+                            application_confirmation = (
+                                ApplicationConfirmation.model_validate(tool_output)
+                            )
                     reply = str(tool_output["message"])
                     terminal_tool_result = True
                     break
@@ -253,6 +270,8 @@ class Orchestrator:
             tool_calls=calls_for_response,
             jobs=displayed_jobs,
             applications=applications,
+            application_confirmation=application_confirmation,
+            application_result=application_result,
             profile=profile,
         )
 

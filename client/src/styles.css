@@ -115,6 +115,21 @@ button { cursor: pointer; }
 .application-row strong { font-size: 10px; }
 .application-row div > span { color: var(--muted); font-size: 9px; margin-top: 4px; }
 .status-pill { background: #e8f8f0; border-radius: 20px; color: #287b57; font-size: 8px; padding: 5px 8px; }
+.status-dry_run { background: #fff5dc; color: #8b6514; }
+.status-needs_manual { background: #fff0e5; color: #a45419; }
+.status-failed { background: #fff0ef; color: #a3433a; }
+.status-in_progress { background: #eef1ff; color: #4d5d9c; }
+.status-duplicate { background: #f0efff; color: #6457bb; }
+.application-detail { color: #59627a; font-size: 9px; line-height: 1.5; margin: 7px 0 0; max-width: 390px; }
+.application-link { color: #6458c4; display: inline-block; font-size: 9px; margin-top: 7px; text-decoration: none; }
+.application-link:hover { text-decoration: underline; }
+.application-outcome, .application-confirmation { background: #fff; border: 1px solid var(--line); border-radius: 12px; margin-top: 11px; max-width: 540px; padding: 13px 15px; }
+.application-outcome-heading { align-items: center; display: flex; flex-wrap: wrap; gap: 9px; justify-content: space-between; }
+.application-outcome-heading strong { color: #202943; font-size: 10px; }
+.application-outcome p, .application-confirmation p { color: #59627a; font-size: 10px; line-height: 1.5; margin: 8px 0 0; }
+.application-confirmation p:first-child { margin-top: 0; }
+.button-secondary { background: #f0efff; color: #51459d; }
+.button-secondary:hover { background: #e4e0ff; }
 .empty-state { color: var(--muted); font-size: 11px; }
 
 .typing-row { align-items: flex-start; }
