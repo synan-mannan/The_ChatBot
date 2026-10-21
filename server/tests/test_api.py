@@ -4,6 +4,7 @@ from collections import deque
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+import json
 
 from docx import Document
 from fastapi.testclient import TestClient
@@ -39,11 +40,20 @@ class ScriptedModel:
         assert "Never invent a job" in system_instruction
         return self.turns.popleft()
 
+    def format_tool_response(
+        self, call: NativeToolCall, output: dict[str, Any]
+    ) -> dict[str, str]:
+        return {
+            "role": "tool",
+            "tool_call_id": call.call_id or "test-call",
+            "content": json.dumps(output),
+        }
+
 
 def tool_turn(name: str, arguments: dict[str, Any]) -> LLMTurn:
     return LLMTurn(
         text="",
-        tool_calls=[NativeToolCall(name, arguments)],
+        tool_calls=[NativeToolCall(name, arguments, f"test-{name}")],
         model_content=f"call-{name}",
     )
 
@@ -189,3 +199,20 @@ def test_resume_profile_is_restored_from_database_after_restart(tmp_path: Path) 
 
     assert response.status_code == 200
     assert response.json()["profile"]["name"] == "Jordan Lee"
+
+
+def test_health_reports_groq_when_groq_key_is_configured(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        groq_api_key="test-groq-key",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'health.db'}",
+        jobs_file=str(ROOT / "data" / "jobs.json"),
+        client_dist=str(ROOT / "client" / "dist"),
+    )
+
+    with TestClient(create_app(settings, ScriptedModel([]))) as client:
+        response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json()["llm_configured"] is True
+    assert response.json()["llm_provider"] == "groq"

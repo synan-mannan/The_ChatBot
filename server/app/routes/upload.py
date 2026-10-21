@@ -12,7 +12,6 @@ from server.app.models.db import ResumeProfileRow
 from server.app.models.schemas import ResumeProfile, UploadResponse
 from server.app.routes.dependencies import get_database_session
 from server.app.services.llm import (
-    GeminiService,
     LLMUnavailableError,
     ProfileExtractionError,
 )
@@ -36,7 +35,7 @@ async def upload_resume(
     except ResumeValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    model: GeminiService = request.app.state.model
+    model = request.app.state.model
     try:
         profile = await model.extract_profile(resume_text)
     except ProfileExtractionError as exc:

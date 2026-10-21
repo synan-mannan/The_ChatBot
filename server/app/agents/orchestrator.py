@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
-from google.genai import types
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,8 +12,8 @@ from server.app.models.schemas import (
     JobRecommendation,
     ToolCall,
 )
-from server.app.services.llm import GeminiService, LLMTurn
-from server.app.services.sessions import SessionState, SessionStore
+from server.app.services.llm import LLMTurn, NativeToolCall
+from server.app.services.sessions import SessionStore
 from server.app.tools.applications import (
     APPLY_DEFINITION,
     LIST_DEFINITION,
@@ -54,11 +53,15 @@ class ChatModel(Protocol):
         system_instruction: str,
     ) -> LLMTurn: ...
 
+    def format_tool_response(
+        self, call: NativeToolCall, output: dict[str, Any]
+    ) -> Any: ...
+
 
 class Orchestrator:
     def __init__(
         self,
-        model: ChatModel | GeminiService,
+        model: ChatModel,
         store: SessionStore,
         jobs: list[Job],
     ) -> None:
@@ -132,17 +135,7 @@ class Orchestrator:
                         ApplicationView.model_validate(item)
                         for item in tool_output["applications"]
                     ]
-                contents.append(
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_function_response(
-                                name=call.name,
-                                response=tool_output,
-                            )
-                        ],
-                    )
-                )
+                contents.append(self.model.format_tool_response(call, tool_output))
             if len(calls_for_response) >= MAX_TOOL_ITERATIONS:
                 break
         if not reply:

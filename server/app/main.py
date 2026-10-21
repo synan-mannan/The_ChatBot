@@ -17,7 +17,7 @@ from server.app.routes.chat import router as chat_router
 from server.app.routes.health import router as health_router
 from server.app.routes.upload import router as upload_router
 from server.app.services.job_catalog import load_jobs
-from server.app.services.llm import GeminiService
+from server.app.services.llm import create_llm_service
 from server.app.services.sessions import SessionStore
 
 logger = logging.getLogger("aijob")
@@ -32,7 +32,7 @@ def create_app(settings: Settings | None = None, model: object | None = None) ->
         engine, session_factory = create_database(active_settings.database_url)
         await initialize_database(engine)
         session_store = SessionStore()
-        llm = model or GeminiService(active_settings)
+        llm = model or create_llm_service(active_settings)
         app.state.settings = active_settings
         app.state.jobs = jobs
         app.state.engine = engine

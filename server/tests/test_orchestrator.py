@@ -1,4 +1,5 @@
 from typing import Any
+import json
 
 import pytest
 import pytest_asyncio
@@ -27,6 +28,15 @@ class MockLLM:
         turn = self.turns[self.calls]
         self.calls += 1
         return turn
+
+    def format_tool_response(
+        self, call: NativeToolCall, output: dict[str, Any]
+    ) -> dict[str, str]:
+        return {
+            "role": "tool",
+            "tool_call_id": call.call_id or "mock-call",
+            "content": json.dumps(output),
+        }
 
 
 @pytest_asyncio.fixture
@@ -68,6 +78,7 @@ async def test_orchestrator_runs_native_tool_then_returns_model_reply(database_s
                     NativeToolCall(
                         "recommend_jobs",
                         {"filters": {}, "top_k": 1},
+                        "mock-call-1",
                     )
                 ],
                 model_content="assistant-tool-call",
@@ -97,7 +108,7 @@ async def test_orchestrator_caps_model_iterations(database_session) -> None:
     repeated_tool_turns = [
         LLMTurn(
             text="",
-            tool_calls=[NativeToolCall("parse_resume", {})],
+            tool_calls=[NativeToolCall("parse_resume", {}, f"mock-call-{index}")],
             model_content=f"tool-call-{index}",
         )
         for index in range(5)

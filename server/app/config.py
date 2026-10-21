@@ -14,6 +14,8 @@ class Settings(BaseSettings):
 
     app_name: str = "AIJob"
     database_url: str = "sqlite+aiosqlite:///./data/aijob.db"
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
     jobs_file: str = "data/jobs.json"

@@ -1,6 +1,6 @@
 # AIJob
 
-AIJob is a single-service conversational job assistant. It accepts PDF or DOCX resumes, extracts a structured profile with Gemini, ranks real listings from the checked-in JSON catalog, and records applications in SQLAlchemy-backed storage. The React client is built into `client/dist` and served by FastAPI.
+AIJob is a single-service conversational job assistant. It accepts PDF or DOCX resumes, extracts a structured profile with Groq or Gemini, ranks real listings from the checked-in JSON catalog, and records applications in SQLAlchemy-backed storage. The React client is built into `client/dist` and served by FastAPI.
 
 ## Architecture
 
@@ -10,13 +10,13 @@ flowchart LR
     API --> Sessions["SessionStore\nprofile + active filters + displayed jobs"]
     API --> DB[("SQLAlchemy 2.0\nSQLite / Postgres")]
     API --> Agent["Orchestrator\nmax 5 model turns"]
-    Agent <-->|native function calls| Gemini["Gemini API"]
+    Agent <-->|native function calls| LLM["Groq or Gemini API"]
     Agent --> Tools["Pydantic tools"]
     Tools --> Catalog["data/jobs.json\nloaded at startup"]
     Tools --> Matcher["TF-IDF + deterministic scoring"]
     Tools --> DB
     Upload["PDF / DOCX"] --> Parser["pypdf / python-docx"]
-    Parser --> Gemini
+    Parser --> LLM
     Scraper["scripts/scrape.py"] --> Sources["Public job-board APIs"]
     Sources --> Catalog
 ```
@@ -24,8 +24,8 @@ flowchart LR
 ### Turn data flow
 
 1. The browser creates an anonymous UUID in `localStorage` and sends it with each request.
-2. Resume upload is size/type checked, text is extracted, then Gemini returns a Pydantic-validated profile. The profile is stored in SQLite/Postgres; the active session also keeps it in memory.
-3. The orchestrator passes the conversation and Pydantic-derived tool schemas to Gemini's native function-calling API. At most five model turns/tool actions are processed for one chat request.
+2. Resume upload is size/type checked, text is extracted, then the configured provider returns a Pydantic-validated profile. The profile is stored in SQLite/Postgres; the active session also keeps it in memory.
+3. The orchestrator passes the conversation and Pydantic-derived tool schemas to the selected provider's native function-calling API. At most five model turns/tool actions are processed for one chat request.
 4. `recommend_jobs` applies hard filters first, then computes `0.50 × skill overlap + 0.25 × TF-IDF title similarity + 0.15 × experience fit + 0.10 × location preference`. Match reasons are derived from the listing and profile data.
 5. Apply/list actions use SQLAlchemy. `(session_id, job_id)` is unique in the database; duplicate insertion races are caught and reported with the original application date.
 6. The API response includes text, tool chips, profile, job cards, and/or application records. The client never receives provider stack traces.
@@ -50,7 +50,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env
-# Set GEMINI_API_KEY in .env.
+# Set GROQ_API_KEY in .env (or GEMINI_API_KEY to use Gemini).
 
 cd client
 npm ci
@@ -80,7 +80,7 @@ python -m pytest -q server/tests
 
 ## LLM and job sources
 
-- **LLM:** Google Gemini via the official `google-genai` Python SDK and native function declarations. Set `GEMINI_API_KEY`; `GEMINI_MODEL` defaults to `gemini-2.5-flash`. Provider timeout/rate-limit/server failures receive bounded exponential retries.
+- **LLM:** Groq via the official `groq` Python SDK and native function calling, or Gemini via the official `google-genai` SDK. When both keys are configured, Groq is selected. Set `GROQ_API_KEY`; `GROQ_MODEL` defaults to `llama-3.3-70b-versatile`. Gemini remains available with `GEMINI_API_KEY` and `GEMINI_MODEL` (default `gemini-2.5-flash`). Transient timeout/rate-limit/server failures receive bounded exponential retries.
 - **Job feeds:** Arbeitnow, Remotive, Jobicy, Himalayas, and RemoteOK API adapters are implemented in `scripts/scrape.py`. The committed snapshot currently includes Arbeitnow and Jobicy records. Application buttons link to the original job listing; the assistant records an application but does not submit a third-party application form.
 - **Resume readers:** `pypdf` for text-based PDFs and `python-docx` for DOCX. OCR/scanned PDFs are not supported.
 - **Matching:** scikit-learn TF-IDF title similarity; skill synonyms and the remaining scoring/filter logic are deterministic Python.
@@ -89,7 +89,9 @@ python -m pytest -q server/tests
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | empty | Required to enable chat and resume extraction |
+| `GROQ_API_KEY` | empty | Groq API key; preferred provider when set |
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Groq model name |
+| `GEMINI_API_KEY` | empty | Optional Gemini API key; used when Groq is not configured |
 | `GEMINI_MODEL` | `gemini-2.5-flash` | Gemini model name |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./data/aijob.db` | SQLAlchemy async database URL; use `postgresql://...` for hosted Postgres |
 | `JOBS_FILE` | `data/jobs.json` | Startup-loaded, read-only job catalog |
@@ -106,30 +108,30 @@ Build and run locally:
 ```bash
 docker build -t aijob .
 docker run --rm -p 8000:8000 \
-  -e GEMINI_API_KEY="$GEMINI_API_KEY" \
+  -e GROQ_API_KEY="$GROQ_API_KEY" \
   -e DATABASE_URL="$DATABASE_URL" \
   aijob
 ```
 
-The multi-stage image builds the React client with Node 22 and runs the combined service on Python 3.11. Configure `GEMINI_API_KEY` and a persistent Postgres `DATABASE_URL` as secret environment variables in the hosting provider; do not bake secrets into the image.
+The multi-stage image builds the React client with Node 22 and runs the combined service on Python 3.11. Configure `GROQ_API_KEY` (or `GEMINI_API_KEY`) and a persistent Postgres `DATABASE_URL` as secret environment variables in the hosting provider; do not bake secrets into the image.
 
 ### Render
 
 1. Push this repository to a Git provider and create a Render **Web Service** using the Docker runtime.
-2. Add `GEMINI_API_KEY` and `DATABASE_URL` in the service's environment settings; set `GEMINI_MODEL` if needed.
+2. Add `GROQ_API_KEY` and `DATABASE_URL` in the service's environment settings; set `GROQ_MODEL` if needed.
 3. Deploy. The service listens on Render's injected `PORT`; use `/api/health` for the health check.
 4. Use the public `onrender.com` URL from the completed deployment. Render service creation requires an account and its associated credentials/billing choices.
 
 ### Google Cloud Run
 
 1. Create a Cloud Run service with a container build from this repository (or build/push the Docker image to Artifact Registry).
-2. Configure `GEMINI_API_KEY` and `DATABASE_URL` through Secret Manager-backed environment variables.
+2. Configure `GROQ_API_KEY` and `DATABASE_URL` through Secret Manager-backed environment variables.
 3. Allow unauthenticated invocation if the app should be public, then deploy and use the service URL returned by Cloud Run.
 4. Check `/api/health` on the resulting URL.
 
 ## Limitations
 
-- Chat requires a valid Gemini API key and provider access. No local model or intent-keyword fallback is used.
+- Chat requires a valid Groq or Gemini API key and provider access. No local model or intent-keyword fallback is used.
 - Resume extraction is text-based only; scanned images/OCR, multi-language guarantees, and full contact validation are out of scope.
 - Active filters and the last displayed result list are held in process memory. Profiles and applications persist in the database; a restart clears the transient refinement/display state.
 - Listings are a point-in-time snapshot and can expire. Always verify details and apply through the original source link.

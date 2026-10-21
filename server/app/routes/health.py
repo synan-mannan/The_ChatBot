@@ -17,5 +17,15 @@ async def health(
     return {
         "status": "ok",
         "jobs_loaded": len(request.app.state.jobs),
-        "llm_configured": bool(request.app.state.settings.gemini_api_key),
+        "llm_configured": bool(
+            request.app.state.settings.groq_api_key
+            or request.app.state.settings.gemini_api_key
+        ),
+        "llm_provider": (
+            "groq"
+            if request.app.state.settings.groq_api_key
+            else "gemini"
+            if request.app.state.settings.gemini_api_key
+            else None
+        ),
     }
