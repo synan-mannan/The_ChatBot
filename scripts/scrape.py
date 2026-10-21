@@ -9,9 +9,7 @@ import html
 import json
 import logging
 import re
-import sys
 from collections import Counter
-from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -105,16 +103,19 @@ def plain_text(value: Any) -> str:
 
 
 def extract_skills(description: str, tags: Any = None) -> list[str]:
-    text = f" {description.lower()} "
-    tag_text = " ".join(map(str, tags or [])).lower()
+    text = description.lower()
+    tag_values = tags if isinstance(tags, list) else [tags] if tags else []
+    tag_text = " ".join(map(str, tag_values)).lower()
     found: list[str] = []
     for canonical, aliases in SKILL_TERMS.items():
-        if any(alias in text or alias.strip() == tag_text.strip() for alias in aliases):
-            found.append(canonical)
-    for canonical in SKILL_TERMS:
-        if canonical.lower() in tag_text and canonical not in found:
+        if any(_contains_term(text, alias) or _contains_term(tag_text, alias) for alias in aliases):
             found.append(canonical)
     return sorted(found)
+
+
+def _contains_term(text: str, term: str) -> bool:
+    pattern = re.escape(term.strip())
+    return bool(re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", text, re.I))
 
 
 def extract_experience(description: str, level: str = "") -> str:
