@@ -19,7 +19,7 @@ from urllib.robotparser import RobotFileParser
 import httpx
 from tenacity import (
     AsyncRetrying,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -83,6 +83,12 @@ SOURCE_URLS = {
 }
 
 log = logging.getLogger("aijob.scrape")
+
+
+def _retryable_http_error(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in {429, 500, 502, 503, 504}
+    return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
 
 
 class _TextExtractor(HTMLParser):
@@ -254,7 +260,7 @@ class JobCollector:
         if elapsed < self.delay:
             await asyncio.sleep(self.delay - elapsed)
         async for attempt in AsyncRetrying(
-            retry=retry_if_exception_type((httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError)),
+            retry=retry_if_exception(_retryable_http_error),
             wait=wait_exponential(multiplier=1, min=1, max=8),
             stop=stop_after_attempt(3),
             reraise=True,

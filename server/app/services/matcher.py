@@ -35,15 +35,18 @@ def _skill_overlap(profile_skills: Iterable[str], job_skills: Iterable[str]) -> 
     return len(overlap) / len(candidate), [candidate[key] for key in overlap]
 
 
-def _title_similarity(candidate_title: str | None, job_title: str) -> float:
+def _title_similarity_scores(candidate_title: str | None, job_titles: list[str]) -> list[float]:
     if not candidate_title or not candidate_title.strip():
-        return 0.0
+        return [0.0] * len(job_titles)
+    if not job_titles:
+        return []
     vectorizer = TfidfVectorizer(ngram_range=(1, 2), stop_words="english")
     try:
-        matrix = vectorizer.fit_transform([candidate_title, job_title])
+        matrix = vectorizer.fit_transform([candidate_title, *job_titles])
     except ValueError:
-        return 0.0
-    return float(cosine_similarity(matrix[0:1], matrix[1:2])[0, 0])
+        return [0.0] * len(job_titles)
+    scores = cosine_similarity(matrix[0:1], matrix[1:])[0]
+    return [float(score) for score in scores]
 
 
 def _experience_range(value: str) -> tuple[float, float] | None:
@@ -110,12 +113,13 @@ def recommend_jobs(
 ) -> list[JobRecommendation]:
     active_filters = filters or JobFilters()
     designation = profile.designation or ""
+    eligible_jobs = [job for job in jobs if _passes_filters(job, active_filters)]
+    title_scores = _title_similarity_scores(
+        designation, [job.title for job in eligible_jobs]
+    )
     ranked: list[JobRecommendation] = []
-    for job in jobs:
-        if not _passes_filters(job, active_filters):
-            continue
+    for job, title_score in zip(eligible_jobs, title_scores, strict=True):
         skill_score, overlaps = _skill_overlap(profile.skills, job.skills)
-        title_score = _title_similarity(designation, job.title)
         experience_score, experience_fits = _experience_fit(
             profile.experience_years, job.experience_required
         )
