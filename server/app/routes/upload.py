@@ -9,7 +9,7 @@ from google.genai import errors
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.app.models.db import ResumeProfileRow
-from server.app.models.schemas import ResumeProfile, UploadResponse
+from server.app.models.schemas import UploadResponse
 from server.app.routes.dependencies import get_database_session
 from server.app.services.llm import (
     LLMUnavailableError,

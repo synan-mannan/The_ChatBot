@@ -10,6 +10,7 @@ from server.app.services.llm import (
     LLMUnavailableError,
     NativeToolCall,
     ProfileExtractionError,
+    _parse_profile_output,
     create_llm_service,
 )
 from server.app.tools.jobs import RECOMMEND_DEFINITION
@@ -83,7 +84,7 @@ async def test_profile_extraction_repairs_invalid_json_once(monkeypatch) -> None
     assert profile.name == "Jordan Lee"
     assert profile.skills == ["Python"]
     assert len(prompts) == 2
-    assert "Repair the previous invalid output" in prompts[1]
+    assert "previous response did not match" in prompts[1]
 
 
 @pytest.mark.asyncio
@@ -139,7 +140,42 @@ async def test_groq_repairs_invalid_profile_json_once() -> None:
 
     assert profile.name == "Jordan"
     assert len(client.requests) == 2
-    assert "Repair the previous invalid output" in client.requests[1]["messages"][0]["content"]
+    assert "previous response did not match" in client.requests[1]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize(
+    ("raw_output", "experience_years", "skills"),
+    [
+        (
+            '{"name":"Jordan","skills":"Python, React","experience_years":"5 years"}',
+            5,
+            ["Python", "React"],
+        ),
+        (
+            '```json\n{"name":"Jordan","skills":["Python"],"experience_years":"5+"}\n```',
+            5,
+            ["Python"],
+        ),
+        (
+            '{"name":"Jordan","skills":["Python"],"experience_years":"5-7 years","location":"London"}',
+            None,
+            ["Python"],
+        ),
+        (
+            '{"name":"Jordan","skills":null,"education":null,"experience_years":null}',
+            None,
+            [],
+        ),
+    ],
+)
+def test_resume_profile_extraction_normalizes_common_model_output(
+    raw_output: str, experience_years: int | None, skills: list[str]
+) -> None:
+    profile = _parse_profile_output(raw_output)
+
+    assert profile.name == "Jordan"
+    assert profile.experience_years == experience_years
+    assert profile.skills == skills
 
 
 @pytest.mark.asyncio

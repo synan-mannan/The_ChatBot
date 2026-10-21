@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +16,7 @@ from groq import (
     APITimeoutError,
     AsyncGroq,
 )
+from pydantic import ValidationError
 from tenacity import (
     AsyncRetrying,
     retry_if_exception,
@@ -24,6 +27,8 @@ from tenacity import (
 from server.app.config import Settings
 from server.app.models.schemas import ResumeProfile
 from server.app.tools.base import ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 class LLMUnavailableError(RuntimeError):
@@ -67,6 +72,72 @@ def _retryable(exc: BaseException) -> bool:
     return False
 
 
+def _profile_prompt(resume_text: str) -> str:
+    schema = json.dumps(ResumeProfile.model_json_schema(), ensure_ascii=False)
+    return (
+        "Extract only facts explicitly supported by the resume text. Return exactly one JSON "
+        "object matching this JSON Schema. Do not use markdown or add fields. "
+        "For unknown values, use null for nullable scalar fields and [] for arrays. "
+        "experience_years must be a JSON number (not text such as '5 years') or null. "
+        "skills, education, and projects must be arrays of strings.\n\n"
+        f"JSON SCHEMA:\n{schema}\n\nRESUME TEXT:\n{resume_text}"
+    )
+
+
+def _profile_validation_summary(exc: ValueError | TypeError) -> str:
+    if isinstance(exc, ValidationError):
+        return json.dumps(exc.errors(include_input=False), ensure_ascii=False)
+    if isinstance(exc, json.JSONDecodeError):
+        return f"Invalid JSON: {exc.msg} at character {exc.pos}."
+    return str(exc)
+
+
+def _parse_profile_output(raw: str) -> ResumeProfile:
+    candidate = raw.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, re.I | re.S)
+    if fenced:
+        candidate = fenced.group(1)
+    data = json.loads(candidate)
+    if not isinstance(data, dict):
+        raise ValueError("The response must be a JSON object.")
+
+    fields = ResumeProfile.model_fields
+    normalized = {key: value for key, value in data.items() if key in fields}
+    for field_name in ("skills", "education", "projects"):
+        value = normalized.get(field_name)
+        if value is None:
+            normalized[field_name] = []
+        elif isinstance(value, str):
+            normalized[field_name] = [
+                item.strip()
+                for item in re.split(r"[,;\n]+", value)
+                if item.strip()
+            ]
+    years = normalized.get("experience_years")
+    if isinstance(years, bool):
+        normalized["experience_years"] = None
+    elif isinstance(years, str):
+        match = re.fullmatch(
+            r"\s*(\d+(?:\.\d+)?)\s*(?:\+|years?|yrs?)?\s*",
+            years,
+            re.I,
+        )
+        normalized["experience_years"] = float(match.group(1)) if match else None
+
+    return ResumeProfile.model_validate(normalized)
+
+
+def _profile_repair_prompt(
+    resume_text: str, invalid_output: str, validation_issue: str
+) -> str:
+    return (
+        f"{_profile_prompt(resume_text)}\n\n"
+        "Your previous response did not match the required schema. Correct these validation "
+        f"issues and return one corrected JSON object:\n{validation_issue}\n\n"
+        f"PREVIOUS RESPONSE:\n{invalid_output[:12_000]}"
+    )
+
+
 class GeminiService:
     def __init__(self, settings: Settings, client: genai.Client | None = None) -> None:
         if client is None and not settings.gemini_api_key:
@@ -102,20 +173,11 @@ class GeminiService:
         raise LLMUnavailableError("The AI service did not return a response.")
 
     async def extract_profile(self, resume_text: str) -> ResumeProfile:
-        prompt = (
-            "Extract a resume profile from the text below. Return only a JSON object with these "
-            "keys: name, email, phone, designation, skills, experience_years, "
-            "experience_summary, education, projects. Use null for unknown scalar values and "
-            "empty arrays for unknown list values. Do not infer or invent facts.\n\n"
-            f"RESUME TEXT:\n{resume_text}"
-        )
+        prompt = _profile_prompt(resume_text)
         for attempt_number in range(2):
             if attempt_number:
-                prompt = (
-                    "Repair the previous invalid output. Return only one valid JSON object "
-                    "matching the required resume fields. Do not include markdown or commentary. "
-                    "Use null or empty arrays for unknown values. Do not invent facts.\n\n"
-                    f"RESUME TEXT:\n{resume_text}\n\nINVALID OUTPUT:\n{invalid_output}"
+                prompt = _profile_repair_prompt(
+                    resume_text, invalid_output, validation_issue
                 )
             try:
                 response = await self._generate(
@@ -126,10 +188,14 @@ class GeminiService:
                     ),
                 )
                 invalid_output = response.text or ""
-                profile = ResumeProfile.model_validate_json(invalid_output)
-                return profile
+                return _parse_profile_output(invalid_output)
             except (ValueError, TypeError) as exc:
-                invalid_output = locals().get("invalid_output", "")
+                validation_issue = _profile_validation_summary(exc)
+                logger.warning(
+                    "Gemini resume extraction validation failed on attempt %s/2: %s",
+                    attempt_number + 1,
+                    validation_issue,
+                )
                 if attempt_number == 1:
                     raise ProfileExtractionError(
                         "The resume details couldn't be structured. Please try another resume."
@@ -256,20 +322,11 @@ class GroqService:
         raise LLMUnavailableError("Groq did not return a response.")
 
     async def extract_profile(self, resume_text: str) -> ResumeProfile:
-        prompt = (
-            "Extract a resume profile from the text below. Return only a JSON object with these "
-            "keys: name, email, phone, designation, skills, experience_years, "
-            "experience_summary, education, projects. Use null for unknown scalar values and "
-            "empty arrays for unknown list values. Do not infer or invent facts.\n\n"
-            f"RESUME TEXT:\n{resume_text}"
-        )
+        prompt = _profile_prompt(resume_text)
         for attempt_number in range(2):
             if attempt_number:
-                prompt = (
-                    "Repair the previous invalid output. Return only one valid JSON object "
-                    "matching the required resume fields. Do not include markdown or commentary. "
-                    "Use null or empty arrays for unknown values. Do not invent facts.\n\n"
-                    f"RESUME TEXT:\n{resume_text}\n\nINVALID OUTPUT:\n{invalid_output}"
+                prompt = _profile_repair_prompt(
+                    resume_text, invalid_output, validation_issue
                 )
             response = await self._generate(
                 messages=[{"role": "user", "content": prompt}],
@@ -278,8 +335,14 @@ class GroqService:
             )
             invalid_output = response.choices[0].message.content or ""
             try:
-                return ResumeProfile.model_validate_json(invalid_output)
+                return _parse_profile_output(invalid_output)
             except (ValueError, TypeError) as exc:
+                validation_issue = _profile_validation_summary(exc)
+                logger.warning(
+                    "Groq resume extraction validation failed on attempt %s/2: %s",
+                    attempt_number + 1,
+                    validation_issue,
+                )
                 if attempt_number == 1:
                     raise ProfileExtractionError(
                         "The resume details couldn't be structured. Please try another resume."
