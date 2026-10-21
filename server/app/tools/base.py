@@ -65,7 +65,11 @@ def resolve_job_reference(
             position = int(position_text)
             if 1 <= position <= len(context.state.last_shown_jobs):
                 return get_job(context.state.last_shown_jobs[position - 1].job.id, context.jobs), None
-        return None, f"There is no displayed result {position_text}."
+        maximum = len(context.state.last_shown_jobs)
+        return (
+            None,
+            f"There is no displayed result {position_text}. Valid displayed result numbers are 1-{maximum}.",
+        )
     if lowered_reference.startswith("id:"):
         reference = reference.split(":", 1)[1]
     exact = get_job(reference, context.jobs)

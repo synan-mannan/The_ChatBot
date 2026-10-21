@@ -86,3 +86,8 @@ class ChatResponse(BaseModel):
 class UploadResponse(BaseModel):
     profile: ResumeProfile
     message: str = "Resume parsed successfully."
+
+
+class ApplicationsResponse(BaseModel):
+    applications: list[ApplicationView] = Field(default_factory=list)
+    message: str | None = None
