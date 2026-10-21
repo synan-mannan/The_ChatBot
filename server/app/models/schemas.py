@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StringConstraints
 from typing_extensions import Annotated
@@ -91,3 +91,23 @@ class UploadResponse(BaseModel):
 class ApplicationsResponse(BaseModel):
     applications: list[ApplicationView] = Field(default_factory=list)
     message: str | None = None
+
+
+class ApplicationActionRequest(BaseModel):
+    session_id: SessionId
+    job_id: Annotated[str, StringConstraints(min_length=1, max_length=128, strip_whitespace=True)]
+
+
+class ApplicationActionResponse(BaseModel):
+    status: Literal[
+        "applied",
+        "duplicate",
+        "not_found",
+        "resume_required",
+        "clarification_required",
+    ]
+    message: str
+    job_id: str | None = None
+    title: str | None = None
+    company: str | None = None
+    applied_date: datetime | None = None

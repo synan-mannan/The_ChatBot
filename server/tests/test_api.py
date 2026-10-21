@@ -81,11 +81,8 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
             tool_turn("recommend_jobs", {"filters": {}, "top_k": 2}),
             LLMTurn("Here are two roles matched to your profile.", [], "final-recommendations"),
             tool_turn("apply_to_job", {"job_id": "id:1"}),
-            LLMTurn("Your application has been recorded.", [], "final-apply"),
             tool_turn("list_applications", {}),
-            LLMTurn("Here is your application history.", [], "final-list"),
             tool_turn("apply_to_job", {"job_id": "id:1"}),
-            LLMTurn("You had already applied to that role.", [], "final-duplicate"),
         ]
     )
     settings = Settings(
@@ -120,17 +117,16 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
         assert recommended.status_code == 200
         assert recommended.json()["profile"]["name"] == "Jordan Lee"
         first_job_id = recommended.json()["jobs"][0]["job"]["id"]
+        model.turns[0] = tool_turn("apply_to_job", {"job_id": f"id:{first_job_id}"})
         assert len(recommended.json()["jobs"]) == 2
         assert "call recommend_jobs directly" in model.system_instructions[0]
         assert "uploaded resume profile is available" in model.system_instructions[0]
-        model.turns[0] = tool_turn("apply_to_job", {"job_id": f"id:{first_job_id}"})
-
         applied = client.post(
             "/api/chat",
             json={"session_id": session_id, "message": f"Apply to job ID id:{first_job_id}"},
         )
         assert applied.status_code == 200
-        assert applied.json()["reply"] == "Your application has been recorded."
+        assert applied.json()["reply"].startswith("Application recorded for ")
 
         listed = client.post(
             "/api/chat",
@@ -145,6 +141,7 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
             json={"session_id": session_id, "message": "Apply again"},
         )
         assert duplicate.status_code == 200
+        assert "already applied" in duplicate.json()["reply"].lower()
         applications = client.get(
             "/api/applications", params={"session_id": session_id}
         ).json()["applications"]
@@ -152,6 +149,54 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
 
         assert client.get("/").status_code == 200
         assert client.get("/api/health").json()["jobs_loaded"] == 1800
+
+
+def test_application_card_endpoint_does_not_call_llm(tmp_path: Path) -> None:
+    session_id = "anonymous-browser-session-apply"
+    model = ScriptedModel([])
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'apply-direct.db'}",
+        jobs_file=str(ROOT / "data" / "jobs.json"),
+        client_dist=str(ROOT / "client" / "dist"),
+    )
+
+    app = create_app(settings, model)
+    with TestClient(app) as client:
+        job_id = app.state.jobs[0].id
+        first = client.post(
+            "/api/applications/apply",
+            json={"session_id": session_id, "job_id": job_id},
+        )
+        assert first.status_code == 200
+        assert first.json()["status"] == "resume_required"
+
+        uploaded = client.post(
+            "/api/upload",
+            data={"session_id": session_id},
+            files={
+                "file": (
+                    "jordan.docx",
+                    make_docx(),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+        )
+        assert uploaded.status_code == 200
+
+        first = client.post(
+            "/api/applications/apply",
+            json={"session_id": session_id, "job_id": job_id},
+        )
+        second = client.post(
+            "/api/applications/apply",
+            json={"session_id": session_id, "job_id": job_id},
+        )
+
+    assert first.status_code == 200
+    assert first.json()["status"] == "applied"
+    assert second.status_code == 200
+    assert second.json()["status"] == "duplicate"
+    assert model.turns == deque()
 
 
 def test_upload_rejects_unsupported_file_with_friendly_message(tmp_path: Path) -> None:

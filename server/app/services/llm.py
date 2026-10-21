@@ -342,20 +342,37 @@ class GroqService:
                         **kwargs,
                     )
         except APIStatusError as exc:
+            logger.warning(
+                "Groq request failed: status=%s request_id=%s",
+                exc.status_code,
+                getattr(exc, "request_id", None),
+            )
             if exc.status_code in {401, 403}:
                 raise LLMUnavailableError(
                     "Groq rejected the API credentials. Check GROQ_API_KEY."
                 ) from exc
-            if _retryable(exc):
+            if exc.status_code == 429:
                 raise LLMUnavailableError(
-                    "Groq is temporarily unavailable after retries. Please try again shortly."
+                    "Groq rate limit or quota reached after retries. Wait before trying again, "
+                    "check your Groq usage limits, or switch to Gemini."
+                ) from exc
+            if exc.status_code >= 500:
+                raise LLMUnavailableError(
+                    f"Groq returned a server error (HTTP {exc.status_code}) after retries. "
+                    "Please try again shortly."
                 ) from exc
             raise LLMUnavailableError(
-                "Groq could not process the request. Check the configured model and try again."
+                f"Groq rejected the request (HTTP {exc.status_code}). "
+                "Check the configured model and request settings."
             ) from exc
         except (APIConnectionError, APITimeoutError, httpx.HTTPError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "Groq connection or timeout error after retries: %s",
+                type(exc).__name__,
+            )
             raise LLMUnavailableError(
-                "Groq is temporarily unavailable after retries. Please try again shortly."
+                "Groq could not be reached after retries. Check your network connection "
+                "and try again."
             ) from exc
         raise LLMUnavailableError("Groq did not return a response.")
 

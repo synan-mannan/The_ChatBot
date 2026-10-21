@@ -3,6 +3,8 @@ from typing import Any
 
 import pytest
 from google.genai import errors
+from groq import APIStatusError
+import httpx
 
 from server.app.config import Settings
 from server.app.services.llm import (
@@ -63,6 +65,42 @@ class FakeGroqClient:
 
 def groq_response(message: FakeGroqMessage) -> Any:
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    [
+        (429, "Groq rate limit or quota reached"),
+        (503, "Groq returned a server error"),
+    ],
+)
+async def test_groq_status_errors_return_actionable_messages(
+    status_code: int, message: str
+) -> None:
+    async def fail_request(**_: Any) -> Any:
+        response = httpx.Response(
+            status_code,
+            request=httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions"),
+        )
+        raise APIStatusError(
+            "provider failure",
+            response=response,
+            body={"error": {"message": "provider details"}},
+        )
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fail_request)
+        )
+    )
+    service = GroqService(
+        Settings(_env_file=None, groq_api_key="test", llm_max_retries=1),
+        client=client,
+    )
+
+    with pytest.raises(LLMUnavailableError, match=message):
+        await service._generate(messages=[])
 
 
 @pytest.mark.asyncio

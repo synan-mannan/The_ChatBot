@@ -3,9 +3,10 @@ import json
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 
 from server.app.agents.orchestrator import Orchestrator
-from server.app.models.db import create_database, initialize_database
+from server.app.models.db import ApplicationRow, create_database, initialize_database
 from server.app.models.schemas import Job, ResumeProfile
 from server.app.services.llm import LLMTurn, NativeToolCall
 from server.app.services.sessions import SessionStore
@@ -23,6 +24,7 @@ class MockLLM:
         tools: list[ToolDefinition],
         system_instruction: str,
     ) -> LLMTurn:
+        assert contents
         assert "Never invent a job" in system_instruction
         assert "call recommend_jobs directly" in system_instruction
         assert "profile is available" in system_instruction
@@ -127,3 +129,41 @@ async def test_orchestrator_caps_model_iterations(database_session) -> None:
     assert model.calls == 5
     assert len(result.tool_calls) == 5
     assert "tool-call limit" in result.reply
+
+
+@pytest.mark.asyncio
+async def test_apply_result_is_returned_without_a_second_model_call(database_session) -> None:
+    store = SessionStore()
+    store.set_profile("anonymous-session-123", ResumeProfile(name="Jordan"))
+    model = MockLLM(
+        [
+            LLMTurn(
+                text="",
+                tool_calls=[
+                    NativeToolCall(
+                        "apply_to_job",
+                        {"job_id": "1"},
+                        "apply-call",
+                    )
+                ],
+                model_content="assistant-apply-call",
+            )
+        ]
+    )
+    orchestrator = Orchestrator(model, store, [make_job()])
+
+    result = await orchestrator.chat(
+        "anonymous-session-123",
+        "Apply to job 1",
+        database_session,
+    )
+    applications = await database_session.scalars(
+        select(ApplicationRow).where(
+            ApplicationRow.session_id == "anonymous-session-123"
+        )
+    )
+
+    assert result.reply == "Application recorded for Backend Developer at Example Co."
+    assert len(result.tool_calls) == 1
+    assert model.calls == 1
+    assert len(list(applications)) == 1

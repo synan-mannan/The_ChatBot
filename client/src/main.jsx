@@ -249,8 +249,28 @@ function App() {
     }
   }
 
-  function applyToJob(jobId) {
-    sendMessage(`Record my application for dataset job ID id:${jobId}`);
+  async function applyToJob(jobId) {
+    if (busy) return;
+    setError("");
+    setBusy(true);
+    try {
+      const response = await fetch("/api/applications/apply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: SESSION_ID, job_id: jobId })
+      });
+      const payload = await responseJson(response);
+      setMessages((current) => [...current, {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: payload.message,
+        toolCalls: [{ name: "apply_to_job" }]
+      }]);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (

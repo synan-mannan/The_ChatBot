@@ -97,6 +97,7 @@ class Orchestrator:
         displayed_jobs: list[JobRecommendation] | None = None
         applications: list[ApplicationView] | None = None
         reply = ""
+        terminal_tool_result = False
         iterations = 0
         while iterations < MAX_TOOL_ITERATIONS:
             turn = await self.model.generate_chat(
@@ -143,7 +144,21 @@ class Orchestrator:
                         ApplicationView.model_validate(item)
                         for item in tool_output["applications"]
                     ]
+                if call.name == "apply_to_job":
+                    reply = str(tool_output["message"])
+                    terminal_tool_result = True
+                    break
+                if call.name == "list_applications":
+                    reply = (
+                        self._applications_reply(applications or [])
+                        if tool_output.get("status") == "ok"
+                        else str(tool_output["message"])
+                    )
+                    terminal_tool_result = True
+                    break
                 contents.append(self.model.format_tool_response(call, tool_output))
+            if terminal_tool_result:
+                break
             if len(calls_for_response) >= MAX_TOOL_ITERATIONS:
                 break
         if not reply:
@@ -158,3 +173,15 @@ class Orchestrator:
             applications=applications,
             profile=state.profile,
         )
+
+    @staticmethod
+    def _applications_reply(applications: list[ApplicationView]) -> str:
+        if not applications:
+            return "You don't have any recorded applications yet."
+        lines = ["Here are your recorded applications:"]
+        for application in applications:
+            lines.append(
+                f"- {application.title} at {application.company} "
+                f"({application.status}, applied {application.applied_date:%Y-%m-%d})"
+            )
+        return "\n".join(lines)
