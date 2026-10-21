@@ -72,6 +72,7 @@ def groq_response(message: FakeGroqMessage) -> Any:
     ("status_code", "message"),
     [
         (429, "Groq rate limit or quota reached"),
+        (413, "Groq rejected the request because its payload was too large"),
         (503, "Groq returned a server error"),
     ],
 )

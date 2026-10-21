@@ -356,6 +356,11 @@ class GroqService:
                     "Groq rate limit or quota reached after retries. Wait before trying again, "
                     "check your Groq usage limits, or switch to Gemini."
                 ) from exc
+            if exc.status_code == 413:
+                raise LLMUnavailableError(
+                    "Groq rejected the request because its payload was too large (HTTP 413). "
+                    "Try a shorter message or reduce the amount of context sent."
+                ) from exc
             if exc.status_code >= 500:
                 raise LLMUnavailableError(
                     f"Groq returned a server error (HTTP {exc.status_code}) after retries. "

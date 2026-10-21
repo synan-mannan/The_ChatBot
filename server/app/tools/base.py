@@ -70,25 +70,17 @@ def resolve_job_reference(
             None,
             f"There is no displayed result {position_text}. Valid displayed result numbers are 1-{maximum}.",
         )
-    if lowered_reference.startswith("id:"):
+    explicit_id = lowered_reference.startswith("id:")
+    if explicit_id:
         reference = reference.split(":", 1)[1]
     exact = get_job(reference, context.jobs)
-    positional: Job | None = None
-    if reference.isdecimal():
+    if not explicit_id and reference.isdecimal():
         position = int(reference)
         if 1 <= position <= len(context.state.last_shown_jobs):
             positional_id = context.state.last_shown_jobs[position - 1].job.id
-            positional = get_job(positional_id, context.jobs)
-    if exact and positional and exact.id != positional.id:
-        return None, (
-            f"'{reference}' could mean displayed result {reference} ({positional.title} at "
-            f"{positional.company}) or job ID {exact.id} ({exact.title} at {exact.company}). "
-            f"Reply 'displayed:{reference}' or 'id:{exact.id}'."
-        )
+            return get_job(positional_id, context.jobs), None
     if exact:
         return exact, None
-    if positional:
-        return positional, None
     maximum = len(context.jobs)
     return None, f"I couldn't find job '{reference}'. Valid job IDs are 1-{maximum}."
 

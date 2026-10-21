@@ -70,7 +70,9 @@ async def test_duplicate_application_is_idempotent(database_session) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ambiguous_position_and_job_id_requires_clarification(database_session) -> None:
+async def test_numbered_reference_uses_recent_results_and_id_prefix_selects_dataset_id(
+    database_session,
+) -> None:
     jobs = [make_job("1"), make_job("3"), make_job("7")]
     store = SessionStore()
     context = make_context(database_session, store, jobs)
@@ -79,11 +81,17 @@ async def test_ambiguous_position_and_job_id_requires_clarification(database_ses
         [JobRecommendation(job=jobs[2], score=0.8, match_reasons=["Skills match"])],
     )
 
-    result = await apply_to_job_tool(context, ApplyToJobInput(job_id="1"))
+    displayed_result = await apply_to_job_tool(
+        context, ApplyToJobInput(job_id="1")
+    )
+    explicit_id_result = await apply_to_job_tool(
+        context, ApplyToJobInput(job_id="id:1")
+    )
 
-    assert result["status"] == "clarification_required"
-    assert "displayed:1" in result["message"]
-    assert "id:1" in result["message"]
+    assert displayed_result["status"] == "applied"
+    assert displayed_result["job_id"] == "7"
+    assert explicit_id_result["status"] == "applied"
+    assert explicit_id_result["job_id"] == "1"
 
 
 @pytest.mark.asyncio

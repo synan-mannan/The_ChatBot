@@ -35,6 +35,10 @@ When a tool says resume_required, ask the user to upload a PDF or DOCX resume be
 For any request to find, search, recommend, or match jobs, call recommend_jobs directly. That tool uses
 the resume already uploaded to this session; do not ask the user to upload or parse it again just to
 recommend jobs. Do not call parse_resume as a prerequisite to recommend_jobs.
+For requests to apply to a numbered job, call apply_to_job and use the matching position from the
+most recent recommendations (for example, job 2 means displayed:2). Use an explicit id:N only when
+the user clearly provides a dataset job ID. Do not ask for clarification when the numbered position
+exists in the recent recommendations.
 No job application is submitted externally; apply_to_job records the user's application in this assistant.
 For filters, preserve earlier active filters unless the user asks to remove or replace them.
 Be transparent about missing information, no matches, and failures. Keep replies brief."""
@@ -92,10 +96,18 @@ class Orchestrator:
             "Session state: an uploaded resume profile is "
             f"{'available' if state.profile is not None else 'not available'}."
         )
+        if state.last_shown_jobs:
+            recent_jobs = "\n".join(
+                f"{index}. {recommendation.job.title} at {recommendation.job.company} "
+                f"(dataset ID {recommendation.job.id})"
+                for index, recommendation in enumerate(state.last_shown_jobs, start=1)
+            )
+            system_instruction += f"\nMost recent numbered job results:\n{recent_jobs}"
         contents: list[Any] = [message]
         calls_for_response: list[ToolCall] = []
         displayed_jobs: list[JobRecommendation] | None = None
         applications: list[ApplicationView] | None = None
+        profile = state.profile
         reply = ""
         terminal_tool_result = False
         iterations = 0
@@ -139,6 +151,9 @@ class Orchestrator:
                         JobRecommendation.model_validate(item)
                         for item in tool_output["jobs"]
                     ]
+                    reply = self._recommendations_reply(tool_output)
+                    terminal_tool_result = True
+                    break
                 if call.name == "list_applications" and "applications" in tool_output:
                     applications = [
                         ApplicationView.model_validate(item)
@@ -171,7 +186,18 @@ class Orchestrator:
             tool_calls=calls_for_response,
             jobs=displayed_jobs,
             applications=applications,
-            profile=state.profile,
+            profile=profile,
+        )
+
+    @staticmethod
+    def _recommendations_reply(tool_output: dict[str, Any]) -> str:
+        if tool_output.get("status") == "no_matches":
+            return str(tool_output["message"])
+        count = len(tool_output.get("jobs", []))
+        return (
+            f"I found {count} matching job{'s' if count != 1 else ''}. "
+            "The ranked cards below include match reasons and application buttons. "
+            "You can say, for example, “apply to job 2.”"
         )
 
     @staticmethod

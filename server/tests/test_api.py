@@ -79,10 +79,9 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
             tool_turn("recommend_jobs", {"filters": {}, "top_k": 2}),
-            LLMTurn("Here are two roles matched to your profile.", [], "final-recommendations"),
-            tool_turn("apply_to_job", {"job_id": "id:1"}),
+            tool_turn("apply_to_job", {"job_id": "displayed:2"}),
             tool_turn("list_applications", {}),
-            tool_turn("apply_to_job", {"job_id": "id:1"}),
+            tool_turn("apply_to_job", {"job_id": "displayed:2"}),
         ]
     )
     settings = Settings(
@@ -116,17 +115,21 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
         )
         assert recommended.status_code == 200
         assert recommended.json()["profile"]["name"] == "Jordan Lee"
-        first_job_id = recommended.json()["jobs"][0]["job"]["id"]
-        model.turns[0] = tool_turn("apply_to_job", {"job_id": f"id:{first_job_id}"})
+        second_job_id = recommended.json()["jobs"][1]["job"]["id"]
         assert len(recommended.json()["jobs"]) == 2
+        assert recommended.json()["reply"].startswith("I found 2 matching jobs.")
         assert "call recommend_jobs directly" in model.system_instructions[0]
         assert "uploaded resume profile is available" in model.system_instructions[0]
         applied = client.post(
             "/api/chat",
-            json={"session_id": session_id, "message": f"Apply to job ID id:{first_job_id}"},
+            json={"session_id": session_id, "message": "Apply to job 2"},
         )
         assert applied.status_code == 200
         assert applied.json()["reply"].startswith("Application recorded for ")
+        assert applied.json()["reply"].endswith(
+            f" at {recommended.json()['jobs'][1]['job']['company']}."
+        )
+        assert "2. " in model.system_instructions[1]
 
         listed = client.post(
             "/api/chat",
@@ -135,10 +138,9 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
         assert listed.status_code == 200
         assert len(listed.json()["applications"]) == 1
 
-        model.turns[0] = tool_turn("apply_to_job", {"job_id": f"id:{first_job_id}"})
         duplicate = client.post(
             "/api/chat",
-            json={"session_id": session_id, "message": "Apply again"},
+            json={"session_id": session_id, "message": "Apply to job 2 again"},
         )
         assert duplicate.status_code == 200
         assert "already applied" in duplicate.json()["reply"].lower()
@@ -146,6 +148,7 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
             "/api/applications", params={"session_id": session_id}
         ).json()["applications"]
         assert len(applications) == 1
+        assert applications[0]["job_id"] == second_job_id
 
         assert client.get("/").status_code == 200
         assert client.get("/api/health").json()["jobs_loaded"] == 1800
@@ -251,6 +254,7 @@ def test_resume_profile_is_restored_from_database_after_restart(tmp_path: Path) 
 
     assert response.status_code == 200
     assert response.json()["profile"]["name"] == "Jordan Lee"
+    assert "uploaded resume profile is available" in restart_model.system_instructions[0]
     assert "uploaded resume profile is available" in restart_model.system_instructions[0]
 
 

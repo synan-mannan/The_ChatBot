@@ -116,7 +116,9 @@ APPLY_DEFINITION = ToolDefinition(
     name="apply_to_job",
     description=(
         "Record an application to a valid job from this dataset. Use a displayed result number "
-        "when the user refers to a position such as 'job 3'. Duplicate applications are prevented."
+        "when the user refers to a position such as 'job 3'. Bare numbers refer to the latest "
+        "displayed result; use id:N only for an explicitly provided dataset ID. "
+        "Duplicate applications are prevented."
     ),
     input_model=ApplyToJobInput,
     execute=apply_to_job_tool,

@@ -9,7 +9,6 @@ from server.app.services.matcher import recommend_jobs
 from server.app.tools.base import (
     ToolContext,
     ToolDefinition,
-    get_job,
     resolve_job_reference,
     serialize_recommendations,
 )
@@ -88,7 +87,10 @@ RECOMMEND_DEFINITION = ToolDefinition(
 )
 DETAILS_DEFINITION = ToolDefinition(
     name="get_job_details",
-    description="Return details for one real dataset job ID or a numbered displayed result.",
+    description=(
+        "Return details for one real dataset job ID or a numbered displayed result. "
+        "Bare numbers refer to the latest displayed result; use id:N for an explicit dataset ID."
+    ),
     input_model=GetJobDetailsInput,
     execute=get_job_details_tool,
 )
