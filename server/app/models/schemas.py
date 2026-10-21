@@ -64,6 +64,9 @@ class ApplicationView(BaseModel):
     company: str
     applied_date: datetime
     status: str
+    method: str = "manual"
+    detail: str = ""
+    apply_url: str | None = None
 
 
 class ToolCall(BaseModel):
@@ -97,23 +100,29 @@ class ApplicationsResponse(BaseModel):
 class ApplicationActionRequest(BaseModel):
     session_id: SessionId
     job_id: Annotated[str, StringConstraints(min_length=1, max_length=128, strip_whitespace=True)]
+    confirm: bool = False
 
 
 class ApplicationActionResponse(BaseModel):
     status: Literal[
-        "applied",
-        "duplicate",
-        "not_found",
-        "resume_required",
-        "clarification_required",
+        "confirmation_required",
         "in_progress",
         "submitted",
         "dry_run",
         "needs_manual",
         "failed",
+        "duplicate",
+        "not_found",
+        "resume_required",
+        "clarification_required",
     ]
     message: str
+    method: str | None = None
+    detail: str | None = None
+    plan: str | None = None
     job_id: str | None = None
     title: str | None = None
     company: str | None = None
     applied_date: datetime | None = None
+    apply_url: str | None = None
+    application_status: str | None = None

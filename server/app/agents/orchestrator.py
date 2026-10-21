@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Protocol
 
 from pydantic import ValidationError
@@ -39,8 +40,11 @@ For requests to apply to a numbered job, call apply_to_job and use the matching 
 most recent recommendations (for example, job 2 means displayed:2). Use an explicit id:N only when
 the user clearly provides a dataset job ID. Do not ask for clarification when the numbered position
 exists in the recent recommendations.
-No job application is submitted externally; apply_to_job records the user's application in this assistant.
+Use apply_to_job's two-step confirmation before using an email or ATS application method.
 For filters, preserve earlier active filters unless the user asks to remove or replace them.
+An application is submitted only when apply_to_job returns status submitted. For dry_run, say it
+was a test run and nothing was sent. For needs_manual, provide the apply link and say it was not
+submitted. For failed, explain the failure and offer the link. Never claim success for any other status.
 Be transparent about missing information, no matches, and failures. Keep replies brief."""
 
 TOOL_DEFINITIONS = [
@@ -50,6 +54,38 @@ TOOL_DEFINITIONS = [
     APPLY_DEFINITION,
     LIST_DEFINITION,
 ]
+CONFIRMATION_PHRASES = {
+    "yes",
+    "yes submit",
+    "yes please",
+    "yes please submit",
+    "confirm",
+    "confirm application",
+    "go ahead",
+    "proceed",
+    "submit it",
+    "submit the application",
+}
+REJECTION_PHRASES = {
+    "no",
+    "no thanks",
+    "cancel",
+    "cancel application",
+    "do not submit",
+    "dont submit",
+}
+
+
+def _normalized_short_reply(message: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", message.casefold()).strip()
+
+
+def _is_explicit_confirmation(message: str) -> bool:
+    return _normalized_short_reply(message) in CONFIRMATION_PHRASES
+
+
+def _is_explicit_rejection(message: str) -> bool:
+    return _normalized_short_reply(message) in REJECTION_PHRASES
 
 
 class ChatModel(Protocol):
@@ -103,6 +139,25 @@ class Orchestrator:
                 for index, recommendation in enumerate(state.last_shown_jobs, start=1)
             )
             system_instruction += f"\nMost recent numbered job results:\n{recent_jobs}"
+        if state.pending_application_job_id:
+            pending_job = next(
+                (
+                    job for job in self.jobs
+                    if job.id == state.pending_application_job_id
+                ),
+                None,
+            )
+            if pending_job is not None:
+                system_instruction += (
+                    "\nPending application confirmation: "
+                    f"{pending_job.title} at {pending_job.company} "
+                    f"(dataset ID {pending_job.id}). Only proceed if the user's current message "
+                    "is an explicit affirmative confirmation."
+                )
+        if state.pending_application_job_id and _is_explicit_rejection(message):
+            state.pending_application_job_id = None
+            pending_reply = "Understood. I cancelled the application; nothing was submitted."
+            return ChatResponse(reply=pending_reply, profile=state.profile)
         contents: list[Any] = [message]
         calls_for_response: list[ToolCall] = []
         displayed_jobs: list[JobRecommendation] | None = None
@@ -126,6 +181,18 @@ class Orchestrator:
                 if len(calls_for_response) >= MAX_TOOL_ITERATIONS:
                     break
                 definition = self._tools.get(call.name)
+                call_arguments = dict(call.arguments)
+                if call.name == "apply_to_job":
+                    if (
+                        state.pending_application_job_id
+                        and _is_explicit_confirmation(message)
+                    ):
+                        call_arguments["job_id"] = (
+                            f"id:{state.pending_application_job_id}"
+                        )
+                        call_arguments["confirm"] = True
+                    elif call_arguments.get("confirm") is True:
+                        call_arguments["confirm"] = False
                 if definition is None:
                     tool_output: dict[str, Any] = {
                         "status": "unknown_tool",
@@ -133,10 +200,10 @@ class Orchestrator:
                     }
                 else:
                     calls_for_response.append(
-                        ToolCall(name=call.name, arguments=call.arguments)
+                        ToolCall(name=call.name, arguments=call_arguments)
                     )
                     try:
-                        arguments = definition.input_model.model_validate(call.arguments)
+                        arguments = definition.input_model.model_validate(call_arguments)
                     except ValidationError as exc:
                         tool_output = {
                             "status": "invalid_arguments",

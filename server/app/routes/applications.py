@@ -16,7 +16,7 @@ from server.app.models.schemas import (
     ResumeProfile,
 )
 from server.app.routes.dependencies import get_database_session
-from server.app.services.sessions import SessionStore
+from server.app.services.sessions import SessionStore, restore_resume_path
 from server.app.tools.applications import ApplyToJobInput, apply_to_job_tool
 from server.app.tools.base import ToolContext
 
@@ -36,6 +36,10 @@ async def apply_to_job(
         profile_row = await session.get(ResumeProfileRow, body.session_id)
         if profile_row is not None:
             state.profile = ResumeProfile.model_validate(profile_row.profile_data)
+    if state.profile is not None:
+        await restore_resume_path(
+            state, body.session_id, request.app.state.settings.uploads_dir
+        )
 
     context = ToolContext(
         session_id=body.session_id,
@@ -44,7 +48,9 @@ async def apply_to_job(
         db_session=session,
         jobs=request.app.state.jobs,
     )
-    result = await apply_to_job_tool(context, ApplyToJobInput(job_id=body.job_id))
+    result = await apply_to_job_tool(
+        context, ApplyToJobInput(job_id=body.job_id, confirm=body.confirm)
+    )
     return ApplicationActionResponse.model_validate(result)
 
 
@@ -63,6 +69,9 @@ async def list_applications(
                 message="Please upload a resume before viewing applications."
             )
         state.profile = ResumeProfile.model_validate(profile_row.profile_data)
+    await restore_resume_path(
+        state, session_id, request.app.state.settings.uploads_dir
+    )
 
     job_by_id: dict[str, Job] = {job.id: job for job in request.app.state.jobs}
     rows = await session.scalars(
@@ -77,6 +86,9 @@ async def list_applications(
             company=job_by_id[row.job_id].company,
             applied_date=row.applied_date,
             status=row.status,
+            method=row.method,
+            detail=row.detail,
+            apply_url=row.apply_url,
         )
         for row in rows
         if row.job_id in job_by_id

@@ -50,7 +50,7 @@ class ApplicationRow(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
     status: Mapped[str] = mapped_column(
-        String(32), default="applied", server_default="applied", nullable=False
+        String(32), default="in_progress", server_default="in_progress", nullable=False
     )
     method: Mapped[str] = mapped_column(
         String(32), default="manual", server_default="manual", nullable=False

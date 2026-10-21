@@ -181,7 +181,66 @@ async def test_apply_result_is_returned_without_a_second_model_call(database_ses
                 tool_calls=[
                     NativeToolCall(
                         "apply_to_job",
-                        {"job_id": "1"},
+                        {"job_id": "1", "confirm": False},
+                        "apply-plan-call",
+                    )
+                ], model_content="assistant-plan-call"
+            ),
+            LLMTurn(
+                text="",
+                tool_calls=[
+                    NativeToolCall(
+                        "apply_to_job",
+                        {"job_id": "1", "confirm": True},
+                        "apply-confirm-call",
+                    )
+                ],
+                model_content="assistant-confirm-call",
+            )
+        ]
+    )
+    orchestrator = Orchestrator(model, store, [make_job()])
+
+    plan = await orchestrator.chat(
+        "anonymous-session-123",
+        "Apply to job 1",
+        database_session,
+    )
+    assert plan.reply.startswith("I can open the employer's page")
+    assert plan.reply.endswith("Reply “yes, submit” to continue.")
+    assert await database_session.scalar(select(ApplicationRow)) is None
+
+    result = await orchestrator.chat(
+        "anonymous-session-123",
+        "yes, submit",
+        database_session,
+    )
+    applications = await database_session.scalars(
+        select(ApplicationRow).where(
+            ApplicationRow.session_id == "anonymous-session-123"
+        )
+    )
+
+    assert result.reply.startswith("This application was not submitted")
+    assert len(result.tool_calls) == 1
+    assert model.calls == 2
+    rows = list(applications)
+    assert len(rows) == 1
+    assert rows[0].status == "needs_manual"
+
+
+@pytest.mark.asyncio
+async def test_model_cannot_submit_without_a_prior_confirmation(database_session) -> None:
+    store = SessionStore()
+    store.set_profile("anonymous-session-123", ResumeProfile(name="Jordan"))
+    model = MockLLM(
+        [
+            LLMTurn(
+                text="",
+                tool_calls=[
+                    NativeToolCall(
+                        "apply_to_job",
+                        {"job_id": "1", "confirm": True},
                         "apply-call",
                     )
                 ],
@@ -192,17 +251,8 @@ async def test_apply_result_is_returned_without_a_second_model_call(database_ses
     orchestrator = Orchestrator(model, store, [make_job()])
 
     result = await orchestrator.chat(
-        "anonymous-session-123",
-        "Apply to job 1",
-        database_session,
-    )
-    applications = await database_session.scalars(
-        select(ApplicationRow).where(
-            ApplicationRow.session_id == "anonymous-session-123"
-        )
+        "anonymous-session-123", "Apply to job 1", database_session
     )
 
-    assert result.reply == "Application recorded for Backend Developer at Example Co."
-    assert len(result.tool_calls) == 1
-    assert model.calls == 1
-    assert len(list(applications)) == 1
+    assert "yes, submit" in result.reply
+    assert await database_session.scalar(select(ApplicationRow)) is None

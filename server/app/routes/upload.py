@@ -98,5 +98,7 @@ async def upload_resume(
     await session.commit()
     store: SessionStore = request.app.state.session_store
     store.set_profile(session_id, profile)
-    store.get(session_id).resume_path = str(resume_path)
+    state = store.get(session_id)
+    state.resume_path = str(resume_path)
+    state.pending_application_job_id = None
     return UploadResponse(profile=profile)

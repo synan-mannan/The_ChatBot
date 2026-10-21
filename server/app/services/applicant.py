@@ -397,7 +397,8 @@ async def apply(
         return ApplyResult(
             method,
             "needs_manual",
-            f"This listing needs a manual application. Apply at {job.source_link}.",
+            f"This application was not submitted because this listing requires a manual application. "
+            f"Continue at {job.source_link}.",
             str(job.source_link),
         )
     if not resume_path:

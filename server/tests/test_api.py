@@ -79,9 +79,10 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
     model = ScriptedModel(
         [
             tool_turn("recommend_jobs", {"filters": {}, "top_k": 2}),
-            tool_turn("apply_to_job", {"job_id": "displayed:2"}),
+            tool_turn("apply_to_job", {"job_id": "displayed:2", "confirm": False}),
+            tool_turn("apply_to_job", {"job_id": "displayed:2", "confirm": True}),
             tool_turn("list_applications", {}),
-            tool_turn("apply_to_job", {"job_id": "displayed:2"}),
+            tool_turn("apply_to_job", {"job_id": "displayed:2", "confirm": False}),
         ]
     )
     settings = Settings(
@@ -130,11 +131,20 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
             json={"session_id": session_id, "message": "Apply to job 2"},
         )
         assert applied.status_code == 200
-        assert applied.json()["reply"].startswith("Application recorded for ")
-        assert applied.json()["reply"].endswith(
-            f" at {recommended.json()['jobs'][1]['job']['company']}."
-        )
+        assert applied.json()["reply"].startswith("I can open the employer's page")
+        assert "yes, submit" in applied.json()["reply"]
         assert "2. " in model.system_instructions[1]
+        assert client.get(
+            "/api/applications", params={"session_id": session_id}
+        ).json()["applications"] == []
+
+        submitted = client.post(
+            "/api/chat",
+            json={"session_id": session_id, "message": "yes, submit"},
+        )
+        assert submitted.status_code == 200
+        assert "not submitted" in submitted.json()["reply"].lower()
+        assert recommended.json()["jobs"][1]["job"]["source_link"] in submitted.json()["reply"]
 
         listed = client.post(
             "/api/chat",
@@ -148,7 +158,7 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
             json={"session_id": session_id, "message": "Apply to job 2 again"},
         )
         assert duplicate.status_code == 200
-        assert "already applied" in duplicate.json()["reply"].lower()
+        assert "already recorded" in duplicate.json()["reply"].lower()
         applications = client.get(
             "/api/applications", params={"session_id": session_id}
         ).json()["applications"]
@@ -171,7 +181,9 @@ def test_application_card_endpoint_does_not_call_llm(tmp_path: Path) -> None:
 
     app = create_app(settings, model)
     with TestClient(app) as client:
-        job_id = app.state.jobs[0].id
+        from server.app.services.applicant import pick_method
+
+        job_id = next(job.id for job in app.state.jobs if pick_method(job) == "manual")
         first = client.post(
             "/api/applications/apply",
             json={"session_id": session_id, "job_id": job_id},
@@ -198,13 +210,19 @@ def test_application_card_endpoint_does_not_call_llm(tmp_path: Path) -> None:
         )
         second = client.post(
             "/api/applications/apply",
-            json={"session_id": session_id, "job_id": job_id},
+            json={"session_id": session_id, "job_id": job_id, "confirm": True},
+        )
+        duplicate = client.post(
+            "/api/applications/apply",
+            json={"session_id": session_id, "job_id": job_id, "confirm": True},
         )
 
-    assert first.status_code == 200
-    assert first.json()["status"] == "applied"
-    assert second.status_code == 200
-    assert second.json()["status"] == "duplicate"
+        assert first.status_code == 200
+        assert first.json()["status"] == "confirmation_required"
+        assert second.status_code == 200
+        assert second.json()["status"] == "needs_manual"
+        assert duplicate.status_code == 200
+        assert duplicate.json()["status"] == "duplicate"
     assert model.turns == deque()
 
 

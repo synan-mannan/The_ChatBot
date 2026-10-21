@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from server.app.models.schemas import JobFilters, JobRecommendation, ResumeProfile
 
@@ -11,6 +14,7 @@ class SessionState:
     resume_path: str | None = None
     filters: JobFilters = field(default_factory=JobFilters)
     last_shown_jobs: list[JobRecommendation] = field(default_factory=list)
+    pending_application_job_id: str | None = None
 
 
 class SessionStore:
@@ -36,3 +40,21 @@ class SessionStore:
         state = self.get(session_id)
         state.last_shown_jobs = jobs
         return state
+
+
+async def restore_resume_path(
+    state: SessionState,
+    session_id: str,
+    uploads_dir: str,
+) -> str | None:
+    if state.resume_path and await asyncio.to_thread(Path(state.resume_path).is_file):
+        return state.resume_path
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", session_id):
+        return None
+    session_dir = Path(uploads_dir) / session_id
+    for suffix in (".pdf", ".docx"):
+        candidate = session_dir / f"resume{suffix}"
+        if await asyncio.to_thread(candidate.is_file):
+            state.resume_path = str(candidate)
+            return state.resume_path
+    return None

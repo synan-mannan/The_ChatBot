@@ -13,23 +13,27 @@ from server.app.agents.orchestrator import Orchestrator
 from server.app.models.db import ResumeProfileRow
 from server.app.models.schemas import ChatRequest, ChatResponse, ResumeProfile
 from server.app.services.llm import LLMUnavailableError
-from server.app.services.sessions import SessionStore
+from server.app.services.sessions import SessionStore, restore_resume_path
 from server.app.routes.dependencies import get_database_session
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
 
 async def _restore_profile(
-    session_id: str, session: AsyncSession, store: SessionStore
+    session_id: str,
+    session: AsyncSession,
+    store: SessionStore,
+    uploads_dir: str,
 ) -> None:
     state = store.get(session_id)
+    if state.profile is None:
+        row = await session.scalar(
+            select(ResumeProfileRow).where(ResumeProfileRow.session_id == session_id)
+        )
+        if row is not None:
+            state.profile = ResumeProfile.model_validate(row.profile_data)
     if state.profile is not None:
-        return
-    row = await session.scalar(
-        select(ResumeProfileRow).where(ResumeProfileRow.session_id == session_id)
-    )
-    if row is not None:
-        state.profile = ResumeProfile.model_validate(row.profile_data)
+        await restore_resume_path(state, session_id, uploads_dir)
 
 
 @router.post("/chat", response_model=ChatResponse)
@@ -39,7 +43,12 @@ async def chat(
     session: AsyncSession = Depends(get_database_session),
 ) -> ChatResponse:
     store: SessionStore = request.app.state.session_store
-    await _restore_profile(body.session_id, session, store)
+    await _restore_profile(
+        body.session_id,
+        session,
+        store,
+        request.app.state.settings.uploads_dir,
+    )
     orchestrator: Orchestrator = request.app.state.orchestrator
     try:
         return await orchestrator.chat(body.session_id, body.message, session)
