@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import math
 from typing import Iterable
 
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -82,7 +83,7 @@ def _location_score(profile_location: str | None, job: Job) -> float:
 
 
 def _passes_filters(job: Job, filters: JobFilters) -> bool:
-    if filters.remote_only and not job.is_remote:
+    if filters.remote_only is True and not job.is_remote:
         return False
     if filters.location and filters.location.casefold() not in job.location.casefold() and not job.is_remote:
         return False
@@ -134,10 +135,11 @@ def recommend_jobs(
             reasons.append(f"title similar to '{designation}'")
         if experience_fits is True:
             bounds = _experience_range(job.experience_required)
-            reasons.append(
-                f"experience {profile.experience_years:g}y fits "
-                f"{bounds[0]:g}-{bounds[1]:g}y"
-            )
+            if math.isinf(bounds[1]):
+                required = f"{bounds[0]:g}+y"
+            else:
+                required = f"{bounds[0]:g}-{bounds[1]:g}y"
+            reasons.append(f"experience {profile.experience_years:g}y fits {required}")
         elif experience_fits is False:
             reasons.append("experience is outside the preferred range")
         if location_score and profile_location:

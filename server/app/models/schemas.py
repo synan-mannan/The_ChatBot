@@ -27,7 +27,7 @@ class ResumeProfile(BaseModel):
 class JobFilters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    remote_only: bool = False
+    remote_only: bool | None = None
     location: str | None = None
     required_skill: str | None = None
     experience_min: float | None = Field(default=None, ge=0)
