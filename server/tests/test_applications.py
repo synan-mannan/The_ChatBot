@@ -2,6 +2,8 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select
 
+from server.app.services.applicant import ApplyResult
+from server.app.tools import applications as application_tools
 from server.app.models.db import ApplicationRow, create_database, initialize_database
 from server.app.models.schemas import Job, JobRecommendation, ResumeProfile
 from server.app.services.sessions import SessionStore
@@ -127,3 +129,50 @@ async def test_resume_required_before_application(database_session) -> None:
     result = await apply_to_job_tool(context, ApplyToJobInput(job_id="1"))
 
     assert result["status"] == "resume_required"
+
+
+@pytest.mark.asyncio
+async def test_failed_application_retry_reuses_the_same_database_row(
+    database_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job = make_job("1")
+    store = SessionStore()
+    context = make_context(database_session, store, [job])
+    results = iter(
+        [
+            ApplyResult("manual", "failed", "Temporary failure.", job.source_link),
+            ApplyResult("manual", "needs_manual", "Complete it manually.", job.source_link),
+        ]
+    )
+    calls = 0
+
+    async def fake_apply(*_: object) -> ApplyResult:
+        nonlocal calls
+        calls += 1
+        return next(results)
+
+    monkeypatch.setattr(application_tools, "apply", fake_apply)
+
+    await apply_to_job_tool(context, ApplyToJobInput(job_id="1"))
+    first_attempt = await apply_to_job_tool(
+        context, ApplyToJobInput(job_id="1", confirm=True)
+    )
+    original_row = await database_session.scalar(
+        select(ApplicationRow).where(ApplicationRow.job_id == "1")
+    )
+    assert first_attempt["status"] == "failed"
+    assert original_row is not None
+    original_id = original_row.id
+
+    retry_plan = await apply_to_job_tool(context, ApplyToJobInput(job_id="1"))
+    assert retry_plan["status"] == "confirmation_required"
+    retry = await apply_to_job_tool(
+        context, ApplyToJobInput(job_id="1", confirm=True)
+    )
+    rows = list(await database_session.scalars(select(ApplicationRow)))
+
+    assert retry["status"] == "needs_manual"
+    assert calls == 2
+    assert len(rows) == 1
+    assert rows[0].id == original_id
+    assert rows[0].status == "needs_manual"

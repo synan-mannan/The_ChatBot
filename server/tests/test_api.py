@@ -274,7 +274,8 @@ def test_resume_profile_is_restored_from_database_after_restart(tmp_path: Path) 
     restart_model = ScriptedModel(
         [LLMTurn("Welcome back. Your resume is ready.", [], "restart-response")]
     )
-    with TestClient(create_app(settings, restart_model)) as client:
+    restarted_app = create_app(settings, restart_model)
+    with TestClient(restarted_app) as client:
         response = client.post(
             "/api/chat",
             json={"session_id": session_id, "message": "Hello again"},
@@ -283,7 +284,9 @@ def test_resume_profile_is_restored_from_database_after_restart(tmp_path: Path) 
     assert response.status_code == 200
     assert response.json()["profile"]["name"] == "Jordan Lee"
     assert "uploaded resume profile is available" in restart_model.system_instructions[0]
-    assert "uploaded resume profile is available" in restart_model.system_instructions[0]
+    assert restarted_app.state.session_store.get(session_id).resume_path == str(
+        tmp_path / "uploads" / session_id / "resume.docx"
+    )
 
 
 def test_health_reports_groq_when_groq_key_is_configured(tmp_path: Path) -> None:
