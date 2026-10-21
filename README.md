@@ -81,7 +81,7 @@ python -m pytest -q server/tests
 ## LLM and job sources
 
 - **LLM:** Groq via the official `groq` Python SDK and native function calling, or Gemini via the official `google-genai` SDK. When both keys are configured, Groq is selected. Set `GROQ_API_KEY`; `GROQ_MODEL` defaults to `llama-3.3-70b-versatile`. Gemini remains available with `GEMINI_API_KEY` and `GEMINI_MODEL` (default `gemini-2.5-flash`). Transient timeout/rate-limit/server failures receive bounded exponential retries.
-- **Job feeds:** Arbeitnow, Remotive, Jobicy, Himalayas, and RemoteOK API adapters are implemented in `scripts/scrape.py`. The committed snapshot currently includes Arbeitnow and Jobicy records. Application buttons link to the original job listing; the assistant records an application but does not submit a third-party application form.
+- **Job feeds:** Arbeitnow, Remotive, Jobicy, Himalayas, and RemoteOK API adapters are implemented in `scripts/scrape.py`. The committed snapshot currently includes Arbeitnow and Jobicy records. Application buttons use the listing's source URL; see [Applying to jobs](#applying-to-jobs) for the confirmation and submission behavior.
 - **Resume readers:** `pypdf` for text-based PDFs and `python-docx` for DOCX. OCR/scanned PDFs are not supported.
 - **Matching:** scikit-learn TF-IDF title similarity; skill synonyms and the remaining scoring/filter logic are deterministic Python.
 
@@ -98,6 +98,26 @@ python -m pytest -q server/tests
 | `CLIENT_DIST` | `client/dist` | Built React assets served by FastAPI |
 | `MAX_RESUME_BYTES` | `5242880` | Upload size limit |
 | `LLM_MAX_RETRIES` | `3` | Bounded retries for transient provider errors (1–8) |
+| `REAL_APPLY_ENABLED` | `false` | Enable the final send/submit action after a user confirms |
+| `SMTP_HOST` | empty | STARTTLS SMTP server for email applications |
+| `SMTP_PORT` | `587` | SMTP server port |
+| `SMTP_USER` | empty | Optional SMTP username |
+| `SMTP_PASS` | empty | Optional SMTP password |
+| `SMTP_FROM` | empty | Sender address used for real application emails |
+
+## Applying to jobs
+
+Application actions use a two-step confirmation. AIJob first shows the job, the application plan, and a **Yes, submit** confirmation. Nothing is sent or submitted until the candidate explicitly confirms in a later action. `REAL_APPLY_ENABLED=false` is the default; in this mode email and ATS forms are prepared as dry runs and the final send/submit is skipped.
+
+Supported paths:
+
+- **Email:** Listings with a provided contact email get a prepared message with the candidate's contact information and PDF/DOCX resume attached. Real delivery uses STARTTLS and `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM`.
+- **Greenhouse and Lever:** The assistant opens the listing form, fills standard candidate fields when available, and attaches the resume. Lever links are opened at the `/apply` path. On explicit confirmation with real mode enabled, the assistant submits and only reports success if the page displays a receipt/confirmation message.
+- **Manual:** Other job boards are recorded as needing manual action and include the original listing link. The assistant does not claim these applications were submitted.
+
+CAPTCHA pages are never solved or bypassed. Required custom questions are not guessed; if any remain unanswered, the assistant stops and directs the candidate to finish manually. Third-party form selectors can drift, so a dry run should be checked against the current posting before enabling real submissions. Uploaded resumes contain personal information and are stored under `uploads/{session_id}/resume.<ext>` on disk; protect that storage and use persistent storage appropriate to the deployment. The Docker image is larger because it includes headless Chromium and browser dependencies. Allocate at least **2 GiB memory** to the service on Google Cloud Run.
+
+To enable actual sending/submission, configure the SMTP values for email applications and set `REAL_APPLY_ENABLED=true`. Test with it disabled first. Keep the feature user-driven: one job at a time, only after explicit confirmation.
 
 For hosted deployments use Postgres (Neon/Supabase URLs are supported) so profiles and applications survive service restarts and multiple instances. SQLite is intended for local development.
 
@@ -113,7 +133,7 @@ docker run --rm -p 8000:8000 \
   aijob
 ```
 
-The multi-stage image builds the React client with Node 22 and runs the combined service on Python 3.11. Configure `GROQ_API_KEY` (or `GEMINI_API_KEY`) and a persistent Postgres `DATABASE_URL` as secret environment variables in the hosting provider; do not bake secrets into the image.
+The multi-stage image builds the React client with Node 22 and runs the combined service on Python 3.11. It installs headless Chromium and its system dependencies, increasing the image size; configure Google Cloud Run with at least 2 GiB memory. Configure `GROQ_API_KEY` (or `GEMINI_API_KEY`) and a persistent Postgres `DATABASE_URL` as secret environment variables in the hosting provider; do not bake secrets into the image.
 
 ### Render
 

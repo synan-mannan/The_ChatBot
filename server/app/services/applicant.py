@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -9,6 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
+from server.app.config import get_settings
 from server.app.models.schemas import Job, ResumeProfile
 
 ApplyMethod = Literal["email", "greenhouse", "lever", "manual"]
@@ -26,7 +26,7 @@ class ApplyResult:
 
 
 def _real_apply_enabled() -> bool:
-    return os.getenv("REAL_APPLY_ENABLED", "false").strip().casefold() == "true"
+    return get_settings().real_apply_enabled
 
 
 def pick_method(job: Job) -> ApplyMethod:
@@ -93,7 +93,8 @@ async def apply_by_email(
         content, maintype, subtype = attachment
         name = profile.name or "Job applicant"
         message = EmailMessage()
-        message["From"] = os.getenv("SMTP_FROM", "AIJob <dry-run@example.invalid>")
+        settings = get_settings()
+        message["From"] = settings.smtp_from or "AIJob <dry-run@example.invalid>"
         message["To"] = job.contact_email or ""
         message["Subject"] = f"Application: {job.title} - {name}"
         if profile.email:
@@ -122,19 +123,11 @@ async def apply_by_email(
                 str(job.source_link),
             )
 
-        smtp_host = os.getenv("SMTP_HOST", "").strip()
-        smtp_user = os.getenv("SMTP_USER", "")
-        smtp_password = os.getenv("SMTP_PASS", "")
-        smtp_from = os.getenv("SMTP_FROM", "").strip()
-        try:
-            smtp_port = int(os.getenv("SMTP_PORT", "587"))
-        except ValueError:
-            return ApplyResult(
-                "email",
-                "failed",
-                "SMTP_PORT must be a valid port number. Nothing was sent.",
-                str(job.source_link),
-            )
+        smtp_host = settings.smtp_host.strip()
+        smtp_user = settings.smtp_user
+        smtp_password = settings.smtp_pass
+        smtp_from = settings.smtp_from.strip()
+        smtp_port = settings.smtp_port
         if not smtp_host or not smtp_from:
             return ApplyResult(
                 "email",
@@ -183,7 +176,8 @@ def _lever_apply_url(url: str) -> str:
 async def _has_captcha(page: Any) -> bool:
     captcha = page.locator(
         'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], '
-        '.h-captcha, iframe[title*="captcha" i]'
+        '.h-captcha, .g-recaptcha, iframe[title*="captcha" i], '
+        '[name="g-recaptcha-response"], [name="h-captcha-response"]'
     )
     return await captcha.count() > 0
 
@@ -240,7 +234,7 @@ async def apply_via_form(
             page.set_default_timeout(ACTION_TIMEOUT_MS)
             await page.goto(apply_url, wait_until="domcontentloaded")
 
-            # ATS selectors can drift; verify them against the actual posting before enabling submissions.
+            # Field IDs were verified against a live Anthropic Greenhouse posting; ATS selectors can drift.
             if await _has_captcha(page):
                 result = ApplyResult(
                     ats,

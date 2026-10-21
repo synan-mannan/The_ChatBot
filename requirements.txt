@@ -17,3 +17,5 @@ pytest-asyncio==0.26.0
 python-multipart==0.0.20
 google-genai==1.16.1
 groq==1.7.0
+aiosmtplib==4.0.1
+playwright==1.52.0

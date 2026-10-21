@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     groq_model: str = "llama-3.3-70b-versatile"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+    real_apply_enabled: bool = False
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_pass: str = ""
+    smtp_from: str = ""
     jobs_file: str = "data/jobs.json"
     max_resume_bytes: int = 5 * 1024 * 1024
     uploads_dir: str = "uploads"
