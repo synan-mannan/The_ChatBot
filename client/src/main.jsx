@@ -189,15 +189,20 @@ function App() {
         body: JSON.stringify({ session_id: SESSION_ID, message: messageText })
       });
       const payload = await responseJson(response);
-      setMessages((current) => [...current, {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: payload.reply,
-        toolCalls: payload.tool_calls || [],
-        jobs: payload.jobs,
-        profile: payload.profile,
-        applications: payload.applications
-      }]);
+      setMessages((current) => {
+        const profileAlreadyShown = current.some(
+          (message) => message.role === "assistant" && message.profile
+        );
+        return [...current, {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: payload.reply,
+          toolCalls: payload.tool_calls || [],
+          jobs: payload.jobs,
+          profile: profileAlreadyShown ? undefined : payload.profile,
+          applications: payload.applications
+        }];
+      });
     } catch (requestError) {
       setError(requestError.message);
     } finally {

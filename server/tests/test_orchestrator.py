@@ -24,6 +24,8 @@ class MockLLM:
         system_instruction: str,
     ) -> LLMTurn:
         assert "Never invent a job" in system_instruction
+        assert "call recommend_jobs directly" in system_instruction
+        assert "profile is available" in system_instruction
         assert {tool.name for tool in tools} >= {"recommend_jobs", "apply_to_job"}
         turn = self.turns[self.calls]
         self.calls += 1

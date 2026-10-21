@@ -32,6 +32,9 @@ Use tools to inspect resumes, find jobs, retrieve job details, record applicatio
 Never invent a job, employer, score, application, or resume fact. You may discuss jobs only when they are
 returned by a tool. When a tool says clarification_required, ask the user its exact clarification question.
 When a tool says resume_required, ask the user to upload a PDF or DOCX resume before continuing.
+For any request to find, search, recommend, or match jobs, call recommend_jobs directly. That tool uses
+the resume already uploaded to this session; do not ask the user to upload or parse it again just to
+recommend jobs. Do not call parse_resume as a prerequisite to recommend_jobs.
 No job application is submitted externally; apply_to_job records the user's application in this assistant.
 For filters, preserve earlier active filters unless the user asks to remove or replace them.
 Be transparent about missing information, no matches, and failures. Keep replies brief."""
@@ -84,6 +87,11 @@ class Orchestrator:
             db_session=db_session,
             jobs=self.jobs,
         )
+        system_instruction = (
+            f"{SYSTEM_PROMPT}\n\n"
+            "Session state: an uploaded resume profile is "
+            f"{'available' if state.profile is not None else 'not available'}."
+        )
         contents: list[Any] = [message]
         calls_for_response: list[ToolCall] = []
         displayed_jobs: list[JobRecommendation] | None = None
@@ -94,7 +102,7 @@ class Orchestrator:
             turn = await self.model.generate_chat(
                 contents=contents,
                 tools=TOOL_DEFINITIONS,
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=system_instruction,
             )
             iterations += 1
             if not turn.tool_calls:

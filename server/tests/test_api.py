@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class ScriptedModel:
     def __init__(self, turns: list[LLMTurn]) -> None:
         self.turns = deque(turns)
+        self.system_instructions: list[str] = []
 
     async def extract_profile(self, _: str) -> ResumeProfile:
         return ResumeProfile(
@@ -38,6 +39,9 @@ class ScriptedModel:
         system_instruction: str,
     ) -> LLMTurn:
         assert "Never invent a job" in system_instruction
+        assert contents
+        assert {tool.name for tool in tools} >= {"recommend_jobs", "apply_to_job"}
+        self.system_instructions.append(system_instruction)
         return self.turns.popleft()
 
     def format_tool_response(
@@ -114,8 +118,11 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
             json={"session_id": session_id, "message": "Find jobs for me"},
         )
         assert recommended.status_code == 200
+        assert recommended.json()["profile"]["name"] == "Jordan Lee"
         first_job_id = recommended.json()["jobs"][0]["job"]["id"]
         assert len(recommended.json()["jobs"]) == 2
+        assert "call recommend_jobs directly" in model.system_instructions[0]
+        assert "uploaded resume profile is available" in model.system_instructions[0]
         model.turns[0] = tool_turn("apply_to_job", {"job_id": f"id:{first_job_id}"})
 
         applied = client.post(
@@ -199,6 +206,7 @@ def test_resume_profile_is_restored_from_database_after_restart(tmp_path: Path) 
 
     assert response.status_code == 200
     assert response.json()["profile"]["name"] == "Jordan Lee"
+    assert "uploaded resume profile is available" in restart_model.system_instructions[0]
 
 
 def test_health_reports_groq_when_groq_key_is_configured(tmp_path: Path) -> None:
