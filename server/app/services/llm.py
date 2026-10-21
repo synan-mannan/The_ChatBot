@@ -159,17 +159,55 @@ class GeminiService:
 
     async def _generate(self, **kwargs: Any) -> Any:
         client = self._require_client()
-        async for attempt in AsyncRetrying(
-            retry=retry_if_exception(_retryable),
-            wait=wait_exponential(multiplier=1, min=1, max=8),
-            stop=stop_after_attempt(self.retries),
-            reraise=True,
-        ):
-            with attempt:
-                return await client.aio.models.generate_content(
-                    model=self.model,
-                    **kwargs,
-                )
+        try:
+            async for attempt in AsyncRetrying(
+                retry=retry_if_exception(_retryable),
+                wait=wait_exponential(multiplier=1, min=1, max=8),
+                stop=stop_after_attempt(self.retries),
+                reraise=True,
+            ):
+                with attempt:
+                    return await client.aio.models.generate_content(
+                        model=self.model,
+                        **kwargs,
+                    )
+        except errors.APIError as exc:
+            logger.warning(
+                "Gemini request failed after retries: code=%s status=%s",
+                exc.code,
+                exc.status,
+            )
+            if exc.code in {401, 403}:
+                raise LLMUnavailableError(
+                    "Gemini rejected the API credentials. Check GEMINI_API_KEY."
+                ) from exc
+            if exc.code == 429:
+                raise LLMUnavailableError(
+                    "Gemini rate limit or quota reached. Check your Google AI billing/quota, "
+                    "or configure GROQ_API_KEY to use Groq."
+                ) from exc
+            if exc.code == 404:
+                raise LLMUnavailableError(
+                    f"Gemini model '{self.model}' was not found or is unavailable for this API key. "
+                    "Check GEMINI_MODEL."
+                ) from exc
+            if exc.code is not None and exc.code >= 500:
+                raise LLMUnavailableError(
+                    "Gemini is temporarily unavailable after retries. Please try again shortly."
+                ) from exc
+            raise LLMUnavailableError(
+                f"Gemini rejected the request (HTTP {exc.code or 'unknown'}). "
+                "Check the configured model and request settings."
+            ) from exc
+        except (asyncio.TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
+            logger.warning(
+                "Gemini request timed out or could not connect after retries: %s",
+                type(exc).__name__,
+            )
+            raise LLMUnavailableError(
+                "Gemini could not be reached after retries. Check your network connection "
+                "and try again."
+            ) from exc
         raise LLMUnavailableError("The AI service did not return a response.")
 
     async def extract_profile(self, resume_text: str) -> ResumeProfile:

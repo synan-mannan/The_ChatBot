@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from google.genai import errors
 
 from server.app.config import Settings
 from server.app.services.llm import (
@@ -65,6 +66,55 @@ def groq_response(message: FakeGroqMessage) -> Any:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "status", "message"),
+    [
+        (
+            401,
+            "UNAUTHENTICATED",
+            "Gemini rejected the API credentials. Check GEMINI_API_KEY.",
+        ),
+        (
+            429,
+            "RESOURCE_EXHAUSTED",
+            "Gemini rate limit or quota reached.",
+        ),
+        (
+            404,
+            "NOT_FOUND",
+            "Gemini model 'gemini-2.5-flash' was not found",
+        ),
+        (
+            503,
+            "UNAVAILABLE",
+            "Gemini is temporarily unavailable after retries.",
+        ),
+    ],
+)
+async def test_gemini_api_errors_return_actionable_safe_message(
+    status_code: int, status: str, message: str
+) -> None:
+    async def fail_request(**_: Any) -> Any:
+        raise errors.APIError(
+            status_code,
+            {"message": "Provider detail", "status": status},
+        )
+
+    client = SimpleNamespace(
+        aio=SimpleNamespace(
+            models=SimpleNamespace(generate_content=fail_request)
+        )
+    )
+    service = GeminiService(
+        Settings(gemini_api_key="test", llm_max_retries=1),
+        client=client,
+    )
+
+    with pytest.raises(LLMUnavailableError, match=message):
+        await service._generate(contents="test")
+
+
+@pytest.mark.asyncio
 async def test_profile_extraction_repairs_invalid_json_once(monkeypatch) -> None:
     service = GeminiService(Settings(gemini_api_key="test"), client=object())
     prompts: list[str] = []
@@ -116,7 +166,10 @@ async def test_groq_profile_extraction_uses_json_mode_and_validates() -> None:
             )
         ]
     )
-    service = GroqService(Settings(groq_api_key="test"), client=client)
+    service = GroqService(
+        Settings(_env_file=None, groq_api_key="test"),
+        client=client,
+    )
 
     profile = await service.extract_profile("Jordan Lee is a Python developer.")
 
