@@ -64,7 +64,7 @@ ALLOWED_ANSWER_KEYS = {
     "accept_portal_terms",
 }
 ALLOWED_MAPPING_KEYS = ALLOWED_PROFILE_KEYS | ALLOWED_ANSWER_KEYS
-FORM_TIMEOUT_SECONDS = 30
+FORM_TIMEOUT_SECONDS = 60
 ACTION_TIMEOUT_MS = 8_000
 DOMAIN_INTERVAL = timedelta(seconds=30)
 SESSION_HOUR = timedelta(hours=1)
@@ -340,29 +340,8 @@ _PROFILE_FORM_KEYS = ALLOWED_PROFILE_KEYS - {
 def is_application_form(fields: list[FormField]) -> bool:
     if not fields or not any(field.visible for field in fields):
         return False
-    form_text = next((field.form_text for field in fields if field.form_text), "")
-    for field_info in fields:
-        if _is_marketing_checkbox(field_info):
-            form_text = re.sub(
-                re.escape(field_info.label),
-                "",
-                form_text,
-                flags=re.I,
-            )
-    description = " ".join(
-        " ".join(
-            (
-                field.form_metadata,
-                form_text,
-                "" if _is_marketing_checkbox(field) else field.label,
-                "" if _is_marketing_checkbox(field) else field.name,
-                "" if _is_marketing_checkbox(field) else field.field_id,
-                "" if _is_marketing_checkbox(field) else field.metadata,
-            )
-        )
-        for field in fields
-    )
-    if _NON_APPLICATION_FORM.search(description):
+    form_metadata = " ".join(field.form_metadata for field in fields)
+    if _NON_APPLICATION_FORM.search(form_metadata):
         return False
     file_upload = any(
         field.field_type == "file"
@@ -561,7 +540,8 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
             visible = await control.is_visible()
             info = await control.evaluate(
                 """element => {
-                  const text = node => (node?.innerText || node?.textContent || '').trim();
+                  const text = node => node?.tagName?.toLowerCase() === 'script'
+                    ? '' : (node?.innerText || node?.textContent || '').trim();
                   const labels = element.labels ? Array.from(element.labels).map(text).filter(Boolean) : [];
                   const fieldset = element.closest('fieldset');
                   let preceding = '';
@@ -610,6 +590,11 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
             info["visible"] = visible
             field_type = str(info["type"])
             if field_type in {"submit", "button", "reset", "hidden", "image"}:
+                continue
+            if str(info["name"]).casefold() in {
+                "g-recaptcha-response",
+                "h-captcha-response",
+            }:
                 continue
             if field_type == "radio":
                 group = str(info["name"] or f"radio-{index}")
@@ -670,14 +655,27 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
     return fields
 
 
+async def _visible_challenge(frame: Any) -> bool:
+    selectors = (
+        'iframe[src*="recaptcha"][src*="bframe"]',
+        'iframe[title*="recaptcha challenge" i]',
+        'iframe[src*="hcaptcha.com"][src*="challenge"]',
+        ".h-captcha iframe",
+        ".cf-turnstile iframe",
+        '.g-recaptcha:not([data-size="invisible"]) iframe',
+    )
+    for selector in selectors:
+        widgets = frame.locator(selector)
+        for index in range(await widgets.count()):
+            box = await widgets.nth(index).bounding_box()
+            if box and box["width"] > 100 and box["height"] > 40:
+                return True
+    return False
+
+
 async def _blocker_reason(frames: list[Any], url: str) -> str | None:
     for frame in frames:
-        captcha = frame.locator(
-            'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="turnstile"], '
-            '.h-captcha, .g-recaptcha, .cf-turnstile, '
-            '[name="g-recaptcha-response"], [name="h-captcha-response"]'
-        )
-        if await captcha.count():
+        if await _visible_challenge(frame):
             return "A CAPTCHA is present. I stopped without attempting to solve it."
     page_text = ""
     for frame in frames:
@@ -686,13 +684,14 @@ async def _blocker_reason(frames: list[Any], url: str) -> str | None:
         except Exception:
             continue
     if re.search(
-        r"captcha|verify you are human|checking your browser|security challenge",
+        r"verify you are human|checking your browser|security challenge|"
+        r"i['’]m not a robot|press and hold",
         page_text,
         re.I,
     ):
         return "A CAPTCHA or anti-bot challenge is present. I stopped without attempting to bypass it."
     if re.search(
-        r"sign in|log in|create an account|create account|single sign.on|sso|"
+        r"sign in|log in|create an account|create account|single sign.on|\bsso\b|"
         r"account required|register to apply",
         page_text,
         re.I,
@@ -712,7 +711,7 @@ async def _wait_for_destination(page: Any) -> Any:
     except PlaywrightTimeoutError:
         pass
     try:
-        await page.wait_for_load_state("networkidle", timeout=3_000)
+        await page.wait_for_load_state("networkidle", timeout=10_000)
     except PlaywrightTimeoutError:
         pass
     return page
@@ -763,6 +762,24 @@ async def _activate_apply_control(page: Any, frames: list[Any]) -> Any | None:
         return page
 
 
+async def _wait_for_form_fields(
+    page: Any, timeout_s: float = 15.0
+) -> tuple[list[FormField], list[FormField]]:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    fields: list[FormField] = []
+    discovered: list[FormField] = []
+    while True:
+        try:
+            fields, discovered = await _application_form_fields(list(page.frames))
+        except Exception as exc:
+            fields, discovered = [], []
+            logger.info("form discovery retry: %s", type(exc).__name__)
+        if fields or loop.time() >= deadline:
+            return fields, discovered
+        await asyncio.sleep(0.5)
+
+
 async def _resolve_application_entry(
     page: Any,
 ) -> tuple[Any, list[FormField], list[FormField], str | None]:
@@ -776,8 +793,8 @@ async def _resolve_application_entry(
             if destination is not None:
                 page = destination
                 continue
+        fields, discovered = await _wait_for_form_fields(page)
         frames = list(page.frames)
-        fields, discovered = await _application_form_fields(frames)
         reason = await _blocker_reason(frames, page.url)
         if reason:
             logger.info(
@@ -1241,6 +1258,7 @@ async def fill_application_form(
     model: Any | None = None,
     real_apply_enabled: bool | None = None,
     headed: bool = False,
+    slow_mo_ms: int = 0,
     approved_cover_letter: str | None = None,
     review_submit_exemption: bool = False,
     keep_open: bool = False,
@@ -1313,9 +1331,12 @@ async def fill_application_form(
     try:
         from playwright.async_api import async_playwright
 
-        async with asyncio.timeout(FORM_TIMEOUT_SECONDS):
+        async with asyncio.timeout(300 if headed else FORM_TIMEOUT_SECONDS):
             playwright = await async_playwright().start()
-            browser = await playwright.chromium.launch(headless=not headed)
+            browser = await playwright.chromium.launch(
+                headless=not headed,
+                slow_mo=slow_mo_ms if headed else 0,
+            )
             page = await browser.new_page()
             page.set_default_timeout(ACTION_TIMEOUT_MS)
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)

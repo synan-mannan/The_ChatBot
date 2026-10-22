@@ -1,0 +1,14 @@
+<!doctype html>
+<html><body>
+  <div id="application"></div>
+  <script>
+    window.setTimeout(() => {
+      document.querySelector("#application").innerHTML = `
+        <form>
+          <label>Full name <input name="name" required></label>
+          <label>Email address <input type="email" name="email" required></label>
+          <label>Phone number <input type="tel" name="phone" required></label>
+        </form>`;
+    }, 1200);
+  </script>
+</body></html>

@@ -105,7 +105,7 @@ async def test_aggregator_follow_external_apply_skips_job_alert_form(
         uploads_dir=str(tmp_path),
     )
 
-    assert report.status == "review_ready"
+    assert report.status == "review_ready", report.model_dump()
     assert report.final_url is not None
     assert report.final_url.endswith("/application.html")
     assert {field.label for field in report.filled} == {
@@ -428,6 +428,62 @@ async def test_captcha_and_login_are_manual_blockers(
     assert report.final_url == url
     assert report.debug_screenshot_path and Path(report.debug_screenshot_path).is_file()
     assert report.debug_labels_path and Path(report.debug_labels_path).is_file()
+
+
+@pytest.mark.asyncio
+async def test_invisible_recaptcha_does_not_block_or_add_captcha_fields(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/invisible_recaptcha.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
+        {},
+        None,
+        "review",
+        _job(url, "invisible-captcha"),
+        session_id="session-invisible-captcha",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "review_ready", report.blocker_reason
+    assert "CAPTCHA is present" not in (report.blocker_reason or "")
+    assert not any(
+        "captcha" in label.casefold() or "window.__appdata" in label.casefold()
+        for label in report.discovered_form_labels
+    )
+
+
+@pytest.mark.asyncio
+async def test_waits_for_javascript_rendered_application_form(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/spa_delayed.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
+        {},
+        None,
+        "review",
+        _job(url, "delayed-spa"),
+        session_id="session-delayed-spa",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "review_ready"
+    assert {item.label for item in report.filled} == {
+        "Full name",
+        "Email address",
+        "Phone number",
+    }
 
 
 @pytest.mark.asyncio
