@@ -115,7 +115,7 @@ Supported paths:
 
 - **Email:** Listings with a provided contact email get a prepared message with the candidate's contact information and PDF/DOCX resume attached. Real delivery uses STARTTLS and `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM`.
 - **Greenhouse and Lever:** The assistant opens the listing form, fills standard candidate fields when available, and attaches the resume. Lever links are opened at the `/apply` path. On explicit confirmation with real mode enabled, the assistant submits and only reports success if the page displays a receipt/confirmation message.
-- **Employer career portals:** Other HTTP(S) links are handled by the generic auto-fill engine. The form is filled from the saved resume profile and explicitly supplied application answers, then shown for review; submission requires another explicit user action.
+- **Employer career portals:** Other HTTP(S) links are handled by the generic auto-fill engine. Aggregator listings are followed through up to four Apply links, tabs, and redirects to the employer application page. Newsletter, job-alert, search, login, cookie, and comment forms are never filled. The form is filled from the saved resume profile and explicitly supplied application answers, then shown for review; submission requires another explicit user action.
 - **Manual:** Unsupported pages and safety blockers include the original application link. The assistant does not claim these applications were submitted.
 
 ## Auto-fill
@@ -126,7 +126,9 @@ The generic Playwright engine supports three modes:
 - `review`: fill known fields and save a screenshot; leave the final decision to the user.
 - `submit`: allowed only after the user separately approves a reviewed form and `REAL_APPLY_ENABLED=true`. The engine refuses required blanks or unanswered questions and reports `submitted` only after detecting a portal confirmation.
 
-In chat, say **“apply to job 3”** to see the portal plan, then confirm to open the form for review. The assistant shows the screenshot, filled field labels (never values), and any questions that need answers. Provide missing answers in chat; they are saved for this session and the form is re-run. A `review_ready` form is still **not submitted**. Say **“submit it”** or use the Submit button only after reviewing the form. If `REAL_APPLY_ENABLED=false`, AIJob keeps the application in dry-run mode and does not submit.
+An application form must have a resume/CV upload or at least three fields mapped to candidate profile details. An email-only form is not an application. `review_ready` additionally requires at least three filled fields and either an uploaded resume or filled name, email, and phone. The application record and UI link use the final employer/ATS URL; the report records the detected ATS, filled field labels, missing questions, and screenshot. Manual and failed results also retain a debug screenshot and discovered labels.
+
+In chat, say **“apply to job 3”** to see the portal plan, then confirm to open the form for review. The assistant shows the final application link, screenshot, filled field labels (never values), and any questions that need answers. Provide missing answers in chat; they are saved for this session and the form is re-run. A `review_ready` form is still **not submitted**. Say **“submit it”** or use the Submit button only after reviewing the form. The submit run reopens the stored final URL and reuses the reviewed answer snapshot. If more than one review is pending, AIJob asks which one. If `REAL_APPLY_ENABLED=false`, AIJob keeps the application in dry-run mode and does not submit.
 
 Generate a cover letter only on request. The assistant returns the draft for review; it is included in an application only after the user explicitly approves it for that job.
 
@@ -145,7 +147,7 @@ python scripts/autofill.py --export-profile <session_id>
 
 Safety limits: CAPTCHA (including reCAPTCHA, hCaptcha, and Turnstile), login/account creation/SSO, and LinkedIn, Indeed, Naukri, and Glassdoor are never automated or bypassed. EEO, disability, veteran, criminal-history, legal-attestation, privacy/consent, and free-text questions are never inferred or defaulted; they need explicit user-provided answers or must be completed manually. No stealth plugins, proxy rotation, fake user agents, account creation, or credential handling are used. The engine limits runs to one per domain every 30 seconds and at most five real application attempts per session per hour.
 
-Known limits include custom widgets that do not expose standard inputs, pages requiring manual completion, and selectors or labels that may drift. Always verify the screenshot and the original portal. Resume/profile/answer data and previews are personal data stored under `uploads/{session_id}/`; keep this gitignored directory private. Clearing a session removes its saved profile, applications, resume, and previews.
+Known limits include custom widgets that do not expose standard inputs, pages requiring manual completion, and selectors or labels that may drift. Per-domain throttling waits up to 30 seconds and returns `retry_later` if the wait expires; that transient result preserves any reviewed status and preview. Always verify the screenshot and the original portal. Resume/profile/answer data and previews are personal data stored under `uploads/{session_id}/`; keep this gitignored directory private. Clearing a session removes its saved profile, applications, resume, and previews.
 
 To enable actual sending/submission, configure the SMTP values for email applications and set `REAL_APPLY_ENABLED=true`. Test with it disabled first. Keep the feature user-driven: one job at a time, only after explicit confirmation.
 

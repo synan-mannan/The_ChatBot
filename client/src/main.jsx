@@ -17,11 +17,11 @@ const TOOL_LABELS = {
   parse_resume: "Resume profile",
   recommend_jobs: "Job matching",
   get_job_details: "Job details",
-  apply_to_job: "Application recorded",
+  apply_to_job: "Application status",
   generate_cover_letter: "Cover letter draft",
   approve_cover_letter: "Cover letter approved",
   save_application_answers: "Application answers saved",
-  list_applications: "Application history"
+  list_applications: "Applications list"
 };
 const APPLICATION_STATUS_LABELS = {
   submitted: "Submitted",
@@ -30,6 +30,7 @@ const APPLICATION_STATUS_LABELS = {
   needs_input: "Answers needed",
   needs_manual: "Needs manual action",
   failed: "Failed",
+  retry_later: "Retry later",
   in_progress: "In progress",
   duplicate: "Already recorded"
 };
@@ -104,7 +105,7 @@ function JobCards({ jobs, onApply }) {
             </ul>
             <div className="job-actions">
               <button className="button button-small" onClick={() => onApply(job.id)}>
-                Record application
+                Apply
               </button>
               <a href={job.source_link} target="_blank" rel="noreferrer">
                 View original listing ↗
@@ -134,8 +135,53 @@ function ApplicationList({ applications }) {
                 Open application page ↗
               </a>
             )}
+            {application.detected_ats && (
+              <span>ATS: {application.detected_ats}</span>
+            )}
+            {!!application.filled?.length && (
+              <div className="application-report-section">
+                <strong>Fields filled</strong>
+                <ul>
+                  {application.filled.map((field, index) => (
+                    <li key={`${field.label}-${index}`}>{field.label}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {!!application.needs_input?.length && (
+              <div className="application-report-section">
+                <strong>Reply in chat with these answers</strong>
+                <ul>
+                  {application.needs_input.map((field, index) => (
+                    <li key={`${field.label}-${index}`}>
+                      {field.label}{field.required ? " (required)" : ""}
+                      {!!field.options?.length && <span> — {field.options.join(", ")}</span>}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {application.screenshot_url && (
+              <img
+                className="application-preview"
+                src={application.screenshot_url}
+                alt={`Application preview for ${application.title}`}
+                loading="lazy"
+              />
+            )}
+            {application.debug_screenshot_url && (
+              <a className="application-link" href={application.debug_screenshot_url} target="_blank" rel="noreferrer">
+                Open debug screenshot ↗
+              </a>
+            )}
           </div>
-          <ApplicationStatus status={application.status} />
+          <ApplicationStatus
+            status={
+              application.status === "review_ready" && (application.filled?.length || 0) < 3
+                ? "needs_manual"
+                : application.status
+            }
+          />
         </div>
       ))}
     </div>
@@ -151,13 +197,16 @@ function ApplicationStatus({ status }) {
 }
 
 function ApplicationOutcome({ result, onSubmit, onCancel }) {
-  const canSubmit = ["review_ready", "dry_run"].includes(result.status);
-  const canCancel = ["review_ready", "dry_run", "needs_input"].includes(result.status);
+  const status = result.status === "review_ready" && (result.filled?.length || 0) < 3
+    ? "needs_manual"
+    : result.status;
+  const canSubmit = ["review_ready", "dry_run"].includes(status);
+  const canCancel = ["review_ready", "dry_run", "needs_input"].includes(status);
   return (
     <section className="application-outcome" aria-label="Application result">
       <div className="application-outcome-heading">
         <strong>{result.title} {result.company ? `· ${result.company}` : ""}</strong>
-        <ApplicationStatus status={result.status} />
+        <ApplicationStatus status={status} />
       </div>
       {result.detail && <p>{result.detail}</p>}
       {result.apply_url && (
@@ -165,6 +214,7 @@ function ApplicationOutcome({ result, onSubmit, onCancel }) {
           Open application page ↗
         </a>
       )}
+      {result.detected_ats && <p>Detected ATS: {result.detected_ats}</p>}
       {result.screenshot_url && (
         <img
           className="application-preview"
@@ -185,13 +235,28 @@ function ApplicationOutcome({ result, onSubmit, onCancel }) {
       )}
       {!!result.needs_input?.length && (
         <div className="application-report-section">
-          <strong>Needs your input</strong>
+          <strong>Reply in chat with these answers</strong>
           <ul>
             {result.needs_input.map((field, index) => (
               <li key={`${field.label}-${index}`}>
                 {field.label}{field.required ? " (required)" : ""}
                 {!!field.options?.length && <span> — {field.options.join(", ")}</span>}
               </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {result.debug_screenshot_url && (
+        <a className="application-link" href={result.debug_screenshot_url} target="_blank" rel="noreferrer">
+          Open debug screenshot ↗
+        </a>
+      )}
+      {!!result.discovered_form_labels?.length && (
+        <div className="application-report-section">
+          <strong>Form labels found</strong>
+          <ul>
+            {result.discovered_form_labels.map((label, index) => (
+              <li key={`${label}-${index}`}>{label}</li>
             ))}
           </ul>
         </div>
@@ -235,13 +300,21 @@ function ApplicationConfirmation({ confirmation, onConfirm, onCancel }) {
   );
 }
 
-function ToolChips({ tools }) {
+function ToolChips({ tools, result, confirmation }) {
   if (!tools?.length) return null;
   return (
     <div className="tool-chips" aria-label="Tools used">
       {tools.map((tool, index) => (
         <span className="tool-chip" key={`${tool.name}-${index}`}>
-          <span className="tool-sparkle">✦</span> Used: {TOOL_LABELS[tool.name] || tool.name}
+          <span className="tool-sparkle">✦</span> Used: {
+            tool.name === "apply_to_job"
+              ? confirmation
+                ? "Application plan"
+                : ["review_ready", "dry_run"].includes(result?.status)
+                  ? "Application form prepared"
+                  : "Application status"
+              : TOOL_LABELS[tool.name] || tool.name
+          }
         </span>
       ))}
     </div>
@@ -259,7 +332,13 @@ function Message({ message, onApply, onConfirm, onSubmit, onCancel }) {
             ? <p>{message.content}</p>
             : <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>}
         </div>
-        {!isUser && <ToolChips tools={message.toolCalls} />}
+        {!isUser && (
+          <ToolChips
+            tools={message.toolCalls}
+            result={message.applicationResult}
+            confirmation={message.applicationConfirmation}
+          />
+        )}
         {!isUser && message.profile && <ProfileCard profile={message.profile} />}
         {!isUser && <JobCards jobs={message.jobs} onApply={onApply} />}
         {!isUser && message.applications && <ApplicationList applications={message.applications} />}
@@ -397,7 +476,7 @@ function App() {
         applicationConfirmation: payload.status === "confirmation_required" ? payload : undefined,
         applicationResult: [
           "submitted", "dry_run", "review_ready", "needs_input",
-          "needs_manual", "failed", "duplicate"
+          "needs_manual", "failed", "retry_later", "duplicate"
         ]
           .includes(payload.status) ? payload : undefined
       }]);
