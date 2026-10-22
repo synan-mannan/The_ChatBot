@@ -154,3 +154,4 @@ class ApplicationActionRequest(BaseModel):
     session_id: SessionId
     job_id: Annotated[str, StringConstraints(min_length=1, max_length=128, strip_whitespace=True)]
     confirm: bool = False
+    submit: bool = False

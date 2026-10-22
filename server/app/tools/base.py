@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from server.app.config import Settings, get_settings
 from server.app.models.schemas import Job, JobRecommendation
 from server.app.services.sessions import SessionState, SessionStore
 
@@ -17,6 +18,8 @@ class ToolContext:
     session_store: SessionStore
     db_session: AsyncSession
     jobs: list[Job]
+    model: Any | None = None
+    settings: Settings = field(default_factory=get_settings)
 
 
 @dataclass(frozen=True)

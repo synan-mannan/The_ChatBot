@@ -23,6 +23,8 @@ const TOOL_LABELS = {
 const APPLICATION_STATUS_LABELS = {
   submitted: "Submitted",
   dry_run: "Dry run",
+  review_ready: "Ready for review — not submitted",
+  needs_input: "Answers needed",
   needs_manual: "Needs manual action",
   failed: "Failed",
   in_progress: "In progress",
@@ -145,7 +147,9 @@ function ApplicationStatus({ status }) {
   );
 }
 
-function ApplicationOutcome({ result }) {
+function ApplicationOutcome({ result, onSubmit, onCancel }) {
+  const canSubmit = ["review_ready", "dry_run"].includes(result.status);
+  const canCancel = ["review_ready", "dry_run", "needs_input"].includes(result.status);
   return (
     <section className="application-outcome" aria-label="Application result">
       <div className="application-outcome-heading">
@@ -157,6 +161,54 @@ function ApplicationOutcome({ result }) {
         <a className="application-link" href={result.apply_url} target="_blank" rel="noreferrer">
           Open application page ↗
         </a>
+      )}
+      {result.screenshot_url && (
+        <img
+          className="application-preview"
+          src={result.screenshot_url}
+          alt={`Filled application preview for ${result.title}`}
+          loading="lazy"
+        />
+      )}
+      {!!result.filled?.length && (
+        <div className="application-report-section">
+          <strong>Fields filled</strong>
+          <ul>
+            {result.filled.map((field, index) => (
+              <li key={`${field.label}-${index}`}>{field.label} <span>({field.key})</span></li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {!!result.needs_input?.length && (
+        <div className="application-report-section">
+          <strong>Needs your input</strong>
+          <ul>
+            {result.needs_input.map((field, index) => (
+              <li key={`${field.label}-${index}`}>
+                {field.label}{field.required ? " (required)" : ""}
+                {!!field.options?.length && <span> — {field.options.join(", ")}</span>}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {(canSubmit || canCancel) && (
+        <div className="job-actions">
+          {canSubmit && (
+            <button
+              className="button button-small"
+              onClick={() => onSubmit(result.job_id)}
+              disabled={result.status === "dry_run"}
+              title={result.status === "dry_run" ? "Submission is disabled by server configuration." : ""}
+            >
+              Submit
+            </button>
+          )}
+          <button className="button button-small button-secondary" onClick={onCancel}>
+            Cancel
+          </button>
+        </div>
       )}
     </section>
   );
@@ -170,7 +222,7 @@ function ApplicationConfirmation({ confirmation, onConfirm, onCancel }) {
       <p>Nothing will be sent until you confirm.</p>
       <div className="job-actions">
         <button className="button button-small" onClick={() => onConfirm(confirmation.job_id)}>
-          Yes, submit
+          {confirmation.plan?.includes("prepare and review") ? "Prepare for review" : "Yes, submit"}
         </button>
         <button className="button button-small button-secondary" onClick={onCancel}>
           Cancel
@@ -193,7 +245,7 @@ function ToolChips({ tools }) {
   );
 }
 
-function Message({ message, onApply, onConfirm, onCancel }) {
+function Message({ message, onApply, onConfirm, onSubmit, onCancel }) {
   const isUser = message.role === "user";
   return (
     <div className={`message-row ${isUser ? "message-user" : "message-assistant"}`}>
@@ -216,7 +268,11 @@ function Message({ message, onApply, onConfirm, onCancel }) {
           />
         )}
         {!isUser && message.applicationResult && (
-          <ApplicationOutcome result={message.applicationResult} />
+          <ApplicationOutcome
+            result={message.applicationResult}
+            onSubmit={onSubmit}
+            onCancel={onCancel}
+          />
         )}
       </div>
     </div>
@@ -319,7 +375,7 @@ function App() {
     }
   }
 
-  async function applyToJob(jobId, confirm = false) {
+  async function applyToJob(jobId, confirm = false, submit = false) {
     if (busy) return;
     setError("");
     setBusy(true);
@@ -327,7 +383,7 @@ function App() {
       const response = await fetch("/api/applications/apply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: SESSION_ID, job_id: jobId, confirm })
+        body: JSON.stringify({ session_id: SESSION_ID, job_id: jobId, confirm, submit })
       });
       const payload = await responseJson(response);
       setMessages((current) => [...current, {
@@ -336,7 +392,10 @@ function App() {
         content: payload.message,
         toolCalls: [{ name: "apply_to_job" }],
         applicationConfirmation: payload.status === "confirmation_required" ? payload : undefined,
-        applicationResult: ["submitted", "dry_run", "needs_manual", "failed", "duplicate"]
+        applicationResult: [
+          "submitted", "dry_run", "review_ready", "needs_input",
+          "needs_manual", "failed", "duplicate"
+        ]
           .includes(payload.status) ? payload : undefined
       }]);
     } catch (requestError) {
@@ -388,6 +447,7 @@ function App() {
               message={message}
               onApply={applyToJob}
               onConfirm={(jobId) => applyToJob(jobId, true)}
+              onSubmit={(jobId) => applyToJob(jobId, false, true)}
               onCancel={() => sendMessage("cancel")}
             />
           ))}

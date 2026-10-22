@@ -16,6 +16,8 @@ class SessionState:
     filters: JobFilters = field(default_factory=JobFilters)
     last_shown_jobs: list[JobRecommendation] = field(default_factory=list)
     pending_application_job_id: str | None = None
+    pending_autofill_job_id: str | None = None
+    pending_submission_job_id: str | None = None
 
 
 class SessionStore:

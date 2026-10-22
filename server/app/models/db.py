@@ -60,6 +60,7 @@ class ApplicationRow(Base):
         Text, default="", server_default="", nullable=False
     )
     apply_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    report_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 def _async_database_url(url: str) -> str:
@@ -92,6 +93,7 @@ def _migrate_application_columns(connection: Any) -> None:
         "method": "VARCHAR(32) NOT NULL DEFAULT 'manual'",
         "detail": "TEXT NOT NULL DEFAULT ''",
         "apply_url": "VARCHAR(2048)",
+        "report_data": "JSON",
     }
     for name, definition in additions.items():
         if name not in columns:

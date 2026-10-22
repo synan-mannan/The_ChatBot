@@ -11,8 +11,8 @@ from urllib.parse import urlsplit, urlunsplit
 from server.app.config import get_settings
 from server.app.models.schemas import Job, ResumeProfile
 
-ApplyMethod = Literal["email", "greenhouse", "lever", "manual"]
-ApplyStatus = Literal["submitted", "dry_run", "needs_manual", "failed"]
+ApplyMethod = Literal["email", "greenhouse", "lever", "autofill", "manual"]
+ApplyStatus = Literal["submitted", "dry_run", "review_ready", "needs_input", "needs_manual", "failed"]
 FORM_TIMEOUT_SECONDS = 45
 ACTION_TIMEOUT_MS = 8_000
 
@@ -30,14 +30,21 @@ def _real_apply_enabled() -> bool:
 
 
 def pick_method(job: Job) -> ApplyMethod:
-    if job.contact_email:
-        return "email"
     host = urlsplit(str(job.source_link)).hostname or ""
     host = host.casefold()
+    if any(
+        host == domain or host.endswith(f".{domain}")
+        for domain in ("linkedin.com", "indeed.com", "naukri.com", "glassdoor.com")
+    ):
+        return "autofill"
+    if job.contact_email:
+        return "email"
     if "greenhouse.io" in host:
         return "greenhouse"
     if "lever.co" in host:
         return "lever"
+    if urlsplit(str(job.source_link)).scheme.casefold() in {"http", "https"}:
+        return "autofill"
     return "manual"
 
 
@@ -49,6 +56,12 @@ def describe_plan(job: Job) -> str:
         return "fill and submit the Greenhouse application form"
     if method == "lever":
         return "fill and submit the Lever application form"
+    if method == "autofill":
+        host = urlsplit(str(job.source_link)).hostname or "employer"
+        return (
+            f"prepare and review the application form on the {host} careers portal "
+            "(nothing will be submitted until you separately approve it)"
+        )
     return "open the employer's page (I can't submit this one automatically)"
 
 

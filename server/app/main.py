@@ -39,7 +39,9 @@ def create_app(settings: Settings | None = None, model: object | None = None) ->
         app.state.session_factory = session_factory
         app.state.session_store = session_store
         app.state.model = llm
-        app.state.orchestrator = Orchestrator(llm, session_store, jobs)
+        app.state.orchestrator = Orchestrator(
+            llm, session_store, jobs, settings=active_settings
+        )
         try:
             yield
         finally:

@@ -20,9 +20,12 @@ from server.app.services.sessions import SessionStore
 from server.app.tools.applications import (
     APPLY_DEFINITION,
     LIST_DEFINITION,
+    ApplyToJobInput,
+    apply_to_job_tool,
 )
 from server.app.tools.application_answers import SAVE_APPLICATION_ANSWERS_DEFINITION
 from server.app.tools.base import ToolContext, ToolDefinition
+from server.app.config import Settings, get_settings
 from server.app.tools.jobs import (
     DETAILS_DEFINITION,
     RECOMMEND_DEFINITION,
@@ -45,11 +48,20 @@ the user clearly provides a dataset job ID. Do not ask for clarification when th
 exists in the recent recommendations.
 For applications, call apply_to_job first with confirm=false. Only call it again with confirm=true
 after the user explicitly agrees in a later message containing a clear affirmative confirmation.
-Never infer agreement from the original request to apply.
+For generic employer career portals, this confirmation only prepares the form for review. If the
+form is review_ready, it is NOT submitted until the user explicitly says to submit it in a later
+message. If the report is needs_input, ask for that batch of missing answers; never invent them.
+Report exactly the status, filled field list, missing questions, blockers, and screenshot returned
+by the tool. Never claim submission unless the report status is submitted.
 For filters, preserve earlier active filters unless the user asks to remove or replace them.
-An application is submitted only when apply_to_job returns status submitted. For dry_run, say it
-was a test run and nothing was sent. For needs_manual, provide the apply link and say it was not
-submitted. For failed, explain the failure and offer the link. Never claim success for any other status.
+When a user provides an application answer such as work authorization, salary, relocation, notice
+period, availability, or EEO information, save only the answer they explicitly stated with
+save_application_answers. Never infer or invent application answers.
+An application is submitted only when apply_to_job returns status submitted. For dry_run, say that
+submission is disabled and nothing was sent. For review_ready, say that the form is filled but NOT
+submitted. For needs_input, ask for the listed missing answers in one batch. For needs_manual,
+provide the apply link and say it was not submitted. For failed, explain the failure and offer the
+link. Never claim success for any other status.
 Be transparent about missing information, no matches, and failures. Keep replies brief."""
 
 TOOL_DEFINITIONS = [
@@ -63,6 +75,9 @@ TOOL_DEFINITIONS = [
 CONFIRMATION_PHRASES = {
     "yes",
     "yes submit",
+    "yes prepare",
+    "yes prepare for review",
+    "prepare it",
     "yes please",
     "yes please submit",
     "confirm",
@@ -113,10 +128,12 @@ class Orchestrator:
         model: ChatModel,
         store: SessionStore,
         jobs: list[Job],
+        settings: Settings | None = None,
     ) -> None:
         self.model = model
         self.store = store
         self.jobs = jobs
+        self.settings = settings or get_settings()
         self._tools = {tool.name: tool for tool in TOOL_DEFINITIONS}
 
     async def chat(
@@ -132,6 +149,8 @@ class Orchestrator:
             session_store=self.store,
             db_session=db_session,
             jobs=self.jobs,
+            model=self.model,
+            settings=self.settings,
         )
         system_instruction = (
             f"{SYSTEM_PROMPT}\n\n"
@@ -160,8 +179,17 @@ class Orchestrator:
                     f"(dataset ID {pending_job.id}). Only proceed if the user's current message "
                     "is an explicit affirmative confirmation."
                 )
-        if state.pending_application_job_id and _is_explicit_rejection(message):
+        if (
+            _is_explicit_rejection(message)
+            and (
+                state.pending_application_job_id
+                or state.pending_autofill_job_id
+                or state.pending_submission_job_id
+            )
+        ):
             state.pending_application_job_id = None
+            state.pending_autofill_job_id = None
+            state.pending_submission_job_id = None
             pending_reply = "Understood. I cancelled the application; nothing was submitted."
             return ChatResponse(reply=pending_reply, profile=state.profile)
         contents: list[Any] = [message]
@@ -192,6 +220,15 @@ class Orchestrator:
                 call_arguments = dict(call.arguments)
                 if call.name == "apply_to_job":
                     if (
+                        state.pending_submission_job_id
+                        and _is_explicit_confirmation(message)
+                    ):
+                        call_arguments["job_id"] = (
+                            f"id:{state.pending_submission_job_id}"
+                        )
+                        call_arguments["confirm"] = False
+                        call_arguments["submit"] = True
+                    elif (
                         state.pending_application_job_id
                         and _is_explicit_confirmation(message)
                     ):
@@ -259,6 +296,21 @@ class Orchestrator:
                     break
                 if call.name == "save_application_answers":
                     reply = str(tool_output.get("message", ""))
+                    if (
+                        tool_output.get("status") == "saved"
+                        and state.pending_autofill_job_id
+                    ):
+                        rerun = await apply_to_job_tool(
+                            context,
+                            ApplyToJobInput(
+                                job_id=f"id:{state.pending_autofill_job_id}",
+                                confirm=True,
+                            ),
+                        )
+                        application_result = ApplicationActionResponse.model_validate(
+                            rerun
+                        )
+                        reply = str(rerun["message"])
                     terminal_tool_result = True
                     break
                 contents.append(self.model.format_tool_response(call, tool_output))

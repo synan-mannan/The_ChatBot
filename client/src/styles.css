@@ -116,6 +116,8 @@ button { cursor: pointer; }
 .application-row div > span { color: var(--muted); font-size: 9px; margin-top: 4px; }
 .status-pill { background: #e8f8f0; border-radius: 20px; color: #287b57; font-size: 8px; padding: 5px 8px; }
 .status-dry_run { background: #fff5dc; color: #8b6514; }
+.status-review_ready { background: #eef1ff; color: #4d5d9c; }
+.status-needs_input { background: #fff5dc; color: #8b6514; }
 .status-needs_manual { background: #fff0e5; color: #a45419; }
 .status-failed { background: #fff0ef; color: #a3433a; }
 .status-in_progress { background: #eef1ff; color: #4d5d9c; }
@@ -127,9 +129,14 @@ button { cursor: pointer; }
 .application-outcome-heading { align-items: center; display: flex; flex-wrap: wrap; gap: 9px; justify-content: space-between; }
 .application-outcome-heading strong { color: #202943; font-size: 10px; }
 .application-outcome p, .application-confirmation p { color: #59627a; font-size: 10px; line-height: 1.5; margin: 8px 0 0; }
+.application-preview { border: 1px solid var(--line); border-radius: 9px; display: block; height: auto; margin-top: 12px; max-height: 420px; object-fit: contain; object-position: top; width: 100%; }
+.application-report-section { border-top: 1px solid #eff0f4; color: #39415a; font-size: 10px; margin-top: 12px; padding-top: 10px; }
+.application-report-section ul { line-height: 1.7; margin: 5px 0 0; padding-left: 18px; }
+.application-report-section li span { color: var(--muted); }
 .application-confirmation p:first-child { margin-top: 0; }
 .button-secondary { background: #f0efff; color: #51459d; }
 .button-secondary:hover { background: #e4e0ff; }
+.button:disabled { cursor: not-allowed; opacity: .55; }
 .empty-state { color: var(--muted); font-size: 11px; }
 
 .typing-row { align-items: flex-start; }
