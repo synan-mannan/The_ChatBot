@@ -398,6 +398,12 @@ async def apply(
     job: Job,
     profile: ResumeProfile,
     resume_path: str | None,
+    *,
+    answers: dict[str, str | bool | float] | None = None,
+    session_id: str = "local-session",
+    uploads_dir: str = "uploads",
+    model: Any | None = None,
+    real_apply_enabled: bool | None = None,
 ) -> ApplyResult:
     method = pick_method(job)
     if method == "manual":
@@ -414,6 +420,40 @@ async def apply(
             "failed",
             "No saved resume file is available. Upload your resume again before applying.",
             str(job.source_link),
+        )
+    if method == "autofill":
+        from server.app.services.autofill import fill_application_form
+
+        apply_enabled = (
+            _real_apply_enabled()
+            if real_apply_enabled is None
+            else real_apply_enabled
+        )
+        report = await fill_application_form(
+            str(job.source_link),
+            profile,
+            answers or {},
+            resume_path,
+            "review" if apply_enabled else "dry_run",
+            job,
+            session_id=session_id,
+            uploads_dir=uploads_dir,
+            model=model,
+            real_apply_enabled=apply_enabled,
+        )
+        details = {
+            "review_ready": "The application form is filled and ready for review. It has NOT been submitted.",
+            "dry_run": "Dry run only: the form was prepared; nothing was submitted.",
+            "needs_input": "The form needs user-provided answers before submission.",
+            "needs_manual": report.blocker_reason or "Continue this application manually.",
+            "failed": report.blocker_reason or "The form could not be completed; verify manually.",
+            "submitted": "The portal confirmed receipt of the application.",
+        }
+        return ApplyResult(
+            "autofill",
+            report.status,
+            details[report.status],
+            report.final_url or str(job.source_link),
         )
     if method == "email":
         return await apply_by_email(job, profile, resume_path)

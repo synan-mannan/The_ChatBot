@@ -173,6 +173,13 @@ async def _run_generic_autofill(
     elif report.status == "dry_run":
         context.state.pending_autofill_job_id = None
         context.state.pending_submission_job_id = job.id
+    elif (
+        report.status == "failed"
+        and report.blocker_reason
+        and "rate-limited" in report.blocker_reason.casefold()
+    ):
+        context.state.pending_autofill_job_id = job.id
+        context.state.pending_submission_job_id = None
     else:
         context.state.pending_autofill_job_id = None
         context.state.pending_submission_job_id = None
@@ -260,7 +267,7 @@ async def apply_to_job_tool(
 
     auto_rerun = (
         existing is not None
-        and existing.status == "needs_input"
+        and existing.status in {"needs_input", "failed"}
         and context.state.pending_autofill_job_id == job.id
     )
     retryable_statuses = {"failed", "needs_input"}

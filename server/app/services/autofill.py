@@ -768,7 +768,7 @@ async def fill_application_form(
         )
     rate_reason = await _reserve_run(hostname.casefold(), session_id, mode)
     if rate_reason:
-        return AutofillReport(status="needs_manual", blocker_reason=rate_reason, final_url=url)
+        return AutofillReport(status="failed", blocker_reason=rate_reason, final_url=url)
 
     playwright = None
     browser = None

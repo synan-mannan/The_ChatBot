@@ -7,7 +7,7 @@ AIJob is a single-service conversational job assistant. It accepts PDF or DOCX r
 ```mermaid
 flowchart LR
     Browser["React chat\nlocalStorage session ID"] -->|JSON / multipart| API["FastAPI"]
-    API --> Sessions["SessionStore\nprofile + active filters + displayed jobs"]
+    API --> Sessions["SessionStore\nprofile + answers + active filters + displayed jobs"]
     API --> DB[("SQLAlchemy 2.0\nSQLite / Postgres")]
     API --> Agent["Orchestrator\nmax 5 model turns"]
     Agent <-->|native function calls| LLM["Groq or Gemini API"]
@@ -27,7 +27,7 @@ flowchart LR
 2. Resume upload is size/type checked, text is extracted, then the configured provider returns a Pydantic-validated profile. The profile is stored in SQLite/Postgres; the active session also keeps it in memory.
 3. The orchestrator passes the conversation and Pydantic-derived tool schemas to the selected provider's native function-calling API. At most five model turns/tool actions are processed for one chat request.
 4. `recommend_jobs` applies hard filters first, then computes `0.50 × skill overlap + 0.25 × TF-IDF title similarity + 0.15 × experience fit + 0.10 × location preference`. Match reasons are derived from the listing and profile data.
-5. Apply/list actions use SQLAlchemy. `(session_id, job_id)` is unique in the database; duplicate insertion races are caught and reported with the original application date.
+5. Apply/list actions use SQLAlchemy. `(session_id, job_id)` is unique in the database; duplicate insertion races are caught and reported with the original application date. Candidate answers and approved cover letters are stored with the session profile.
 6. The API response includes text, tool chips, profile, job cards, and/or application records. The client never receives provider stack traces.
 
 ## Job data
@@ -65,7 +65,7 @@ Open `http://localhost:8000`; API documentation is at `http://localhost:8000/doc
 Run tests:
 
 ```bash
-python -m pytest -q server/tests
+python -m pytest -q tests
 ```
 
 ## API
@@ -75,6 +75,8 @@ python -m pytest -q server/tests
 | `POST` | `/api/chat` | JSON `{ "session_id": "...", "message": "..." }`; returns reply, tools used, jobs, applications, and profile |
 | `POST` | `/api/upload` | Multipart `session_id` and `file` (PDF/DOCX, up to 5 MB) |
 | `GET` | `/api/applications?session_id=...` | Lists this anonymous session's recorded applications |
+| `GET` | `/api/applications/{job_id}/preview?session_id=...` | Serves a screenshot only when the application record owns that preview |
+| `DELETE` | `/api/session?session_id=...` | Clears that session's stored profile, applications, resume, and previews |
 | `GET` | `/api/health` | Health status, loaded listing count, and LLM configuration status |
 | `GET` | `/docs` | OpenAPI/Swagger documentation |
 
@@ -107,15 +109,43 @@ python -m pytest -q server/tests
 
 ## Applying to jobs
 
-Application actions use a two-step confirmation. AIJob first shows the job, the application plan, and a **Yes, submit** confirmation. Nothing is sent or submitted until the candidate explicitly confirms in a later action. `REAL_APPLY_ENABLED=false` is the default; in this mode email and ATS forms are prepared as dry runs and the final send/submit is skipped.
+Application actions retain server-side confirmation. AIJob first shows the job and the application plan. For email and the existing Greenhouse/Lever fast paths, the user confirms before the original send/submit flow proceeds. Generic employer portals use a separate review-then-submit flow described below. `REAL_APPLY_ENABLED=false` is the default and prevents all real submissions.
 
 Supported paths:
 
 - **Email:** Listings with a provided contact email get a prepared message with the candidate's contact information and PDF/DOCX resume attached. Real delivery uses STARTTLS and `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM`.
 - **Greenhouse and Lever:** The assistant opens the listing form, fills standard candidate fields when available, and attaches the resume. Lever links are opened at the `/apply` path. On explicit confirmation with real mode enabled, the assistant submits and only reports success if the page displays a receipt/confirmation message.
-- **Manual:** Other job boards are recorded as needing manual action and include the original listing link. The assistant does not claim these applications were submitted.
+- **Employer career portals:** Other HTTP(S) links are handled by the generic auto-fill engine. The form is filled from the saved resume profile and explicitly supplied application answers, then shown for review; submission requires another explicit user action.
+- **Manual:** Unsupported pages and safety blockers include the original application link. The assistant does not claim these applications were submitted.
 
-CAPTCHA pages are never solved or bypassed. Required custom questions are not guessed; if any remain unanswered, the assistant stops and directs the candidate to finish manually. Third-party form selectors can drift, so a dry run should be checked against the current posting before enabling real submissions. Uploaded resumes contain personal information and are stored under `uploads/{session_id}/resume.<ext>` on disk; protect that storage and use persistent storage appropriate to the deployment. The Docker image is larger because it includes headless Chromium and browser dependencies. Allocate at least **2 GiB memory** to the service on Google Cloud Run.
+## Auto-fill
+
+The generic Playwright engine supports three modes:
+
+- `dry_run`: fill known fields and save a screenshot; never click Submit.
+- `review`: fill known fields and save a screenshot; leave the final decision to the user.
+- `submit`: allowed only after the user separately approves a reviewed form and `REAL_APPLY_ENABLED=true`. The engine refuses required blanks or unanswered questions and reports `submitted` only after detecting a portal confirmation.
+
+In chat, say **“apply to job 3”** to see the portal plan, then confirm to open the form for review. The assistant shows the screenshot, filled field labels (never values), and any questions that need answers. Provide missing answers in chat; they are saved for this session and the form is re-run. A `review_ready` form is still **not submitted**. Say **“submit it”** or use the Submit button only after reviewing the form. If `REAL_APPLY_ENABLED=false`, AIJob keeps the application in dry-run mode and does not submit.
+
+Generate a cover letter only on request. The assistant returns the draft for review; it is included in an application only after the user explicitly approves it for that job.
+
+For local human-operated review:
+
+```bash
+python scripts/autofill.py --url "https://careers.example.com/apply" \
+  --resume resume.pdf --profile profile.json [--answers answers.json] --headed
+```
+
+The CLI opens a visible browser, prints the report, and stays open until Enter. It always uses review mode and never clicks the final submit button. Profile JSON uses the `ResumeProfile` shape. Export a saved session profile with:
+
+```bash
+python scripts/autofill.py --export-profile <session_id>
+```
+
+Safety limits: CAPTCHA (including reCAPTCHA, hCaptcha, and Turnstile), login/account creation/SSO, and LinkedIn, Indeed, Naukri, and Glassdoor are never automated or bypassed. EEO, disability, veteran, criminal-history, legal-attestation, privacy/consent, and free-text questions are never inferred or defaulted; they need explicit user-provided answers or must be completed manually. No stealth plugins, proxy rotation, fake user agents, account creation, or credential handling are used. The engine limits runs to one per domain every 30 seconds and at most five real application attempts per session per hour.
+
+Known limits include custom widgets that do not expose standard inputs, pages requiring manual completion, and selectors or labels that may drift. Always verify the screenshot and the original portal. Resume/profile/answer data and previews are personal data stored under `uploads/{session_id}/`; keep this gitignored directory private. Clearing a session removes its saved profile, applications, resume, and previews.
 
 To enable actual sending/submission, configure the SMTP values for email applications and set `REAL_APPLY_ENABLED=true`. Test with it disabled first. Keep the feature user-driven: one job at a time, only after explicit confirmation.
 

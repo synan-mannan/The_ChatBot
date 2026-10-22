@@ -95,9 +95,9 @@ async def test_initialize_database_migrates_existing_profile_rows() -> None:
     async with engine.connect() as connection:
         row = await connection.execute(
             text(
-                "SELECT answers_data FROM resume_profiles "
+                "SELECT answers_data, approved_cover_letters_data FROM resume_profiles "
                 "WHERE session_id = 'legacy-session'"
             )
         )
-        assert row.scalar_one() == "{}"
+        assert row.one() == ("{}", "{}")
     await engine.dispose()

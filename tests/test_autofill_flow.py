@@ -152,6 +152,43 @@ def test_confirmation_review_preview_and_submit_are_session_scoped(
         assert client.get(preview_url).status_code == 404
 
 
+def test_rate_limited_application_can_be_retried(
+    fixture_server, tmp_path, monkeypatch
+) -> None:
+    calls = 0
+
+    async def rate_limit_once(domain: str, session_id: str, mode: str) -> str | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "Domain rate-limited: try again in 30 seconds."
+        return None
+
+    monkeypatch.setattr(autofill, "_reserve_run", rate_limit_once)
+    session_id = "session-rate-limit"
+    url = f"{fixture_server}/multistep.html"
+    app = create_app(settings=_settings(tmp_path, True), model=object())
+    with TestClient(app) as client:
+        _prepare_session(app, session_id, url)
+        client.post(
+            "/api/applications/apply",
+            json={"session_id": session_id, "job_id": "job-flow"},
+        )
+        limited = client.post(
+            "/api/applications/apply",
+            json={"session_id": session_id, "job_id": "job-flow", "confirm": True},
+        )
+        assert limited.json()["status"] == "failed"
+        assert "rate-limited" in limited.json()["detail"]
+
+        retried = client.post(
+            "/api/applications/apply",
+            json={"session_id": session_id, "job_id": "job-flow"},
+        )
+        assert retried.json()["status"] == "review_ready"
+        assert calls == 2
+
+
 def test_real_apply_disabled_stays_dry_run(fixture_server, tmp_path) -> None:
     session_id = "session-dryrun-123"
     url = f"{fixture_server}/multistep.html"

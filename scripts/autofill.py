@@ -10,8 +10,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+if str(ROOT) in sys.path:
+    sys.path.remove(str(ROOT))
+sys.path.insert(0, str(ROOT))
 
 from server.app.config import get_settings
 from server.app.models.db import ResumeProfileRow, create_database

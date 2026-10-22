@@ -20,6 +20,7 @@ const TOOL_LABELS = {
   apply_to_job: "Application recorded",
   generate_cover_letter: "Cover letter draft",
   approve_cover_letter: "Cover letter approved",
+  save_application_answers: "Application answers saved",
   list_applications: "Application history"
 };
 const APPLICATION_STATUS_LABELS = {
