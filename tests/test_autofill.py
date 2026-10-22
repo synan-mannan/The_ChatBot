@@ -136,6 +136,7 @@ async def test_multistep_review_does_not_submit_and_submit_verifies(fixture_serv
         uploads_dir=str(tmp_path),
     )
     assert review.status == "dry_run"
+    assert "submitted" not in (review.final_url or "")
     assert {item.key for item in review.filled} == {"first_name", "email"}
 
     autofill._DOMAIN_RUNS.clear()
@@ -148,8 +149,10 @@ async def test_multistep_review_does_not_submit_and_submit_verifies(fixture_serv
         _job(url, "submit-job"),
         session_id="session-submit",
         uploads_dir=str(tmp_path),
+        real_apply_enabled=True,
     )
     assert submitted.status == "submitted", submitted.blocker_reason
+    assert "submitted" in (submitted.final_url or "")
 
 
 @pytest.mark.asyncio
@@ -230,7 +233,70 @@ async def test_eeo_and_consent_stay_untouched_and_are_reported(fixture_server, t
     assert {item.label for item in report.needs_input} >= {
         "Gender",
         "I agree to the privacy terms",
+        "Have you been convicted of a felony?",
     }
+
+
+@pytest.mark.asyncio
+async def test_sensitive_answers_are_filled_only_after_explicit_user_input(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/eeo.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(email="ada@example.test"),
+        {
+            "gender": "female",
+            "privacy_consent": True,
+            "criminal_history": "No",
+        },
+        None,
+        "review",
+        _job(url, "sensitive-answers"),
+        session_id="session-sensitive-123",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "review_ready"
+    assert {item.key for item in report.filled} >= {
+        "gender",
+        "privacy_consent",
+        "criminal_history",
+    }
+
+
+@pytest.mark.asyncio
+async def test_cover_letter_is_never_filled_without_explicit_approval(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/cover_letter.html"
+    missing_approval = await fill_application_form(
+        url,
+        ResumeProfile(),
+        {},
+        None,
+        "review",
+        _job(url, "cover-unapproved"),
+        session_id="session-cover-letter",
+        uploads_dir=str(tmp_path),
+    )
+    assert missing_approval.status == "needs_input"
+    assert missing_approval.needs_input[0].label == "Cover letter"
+
+    autofill._DOMAIN_RUNS.clear()
+    approved = await fill_application_form(
+        url,
+        ResumeProfile(),
+        {},
+        None,
+        "review",
+        _job(url, "cover-approved"),
+        session_id="session-cover-letter",
+        uploads_dir=str(tmp_path),
+        approved_cover_letter="Approved candidate cover letter.",
+    )
+    assert approved.status == "review_ready"
+    assert approved.filled[0].key == "cover_letter"
 
 
 @pytest.mark.asyncio
@@ -247,6 +313,7 @@ async def test_submit_refuses_missing_required_and_blocked_domain(
         _job(url),
         session_id="session-required",
         uploads_dir=str(tmp_path),
+        real_apply_enabled=True,
     )
     assert missing.status == "needs_input"
     assert missing.needs_input[0].required
@@ -262,6 +329,27 @@ async def test_submit_refuses_missing_required_and_blocked_domain(
     assert blocked.status == "needs_manual"
 
 
+@pytest.mark.asyncio
+async def test_submit_mode_is_downgraded_when_real_apply_is_disabled(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/multistep.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(name="Ada Lovelace", email="ada@example.test"),
+        {},
+        None,
+        "submit",
+        _job(url),
+        session_id="session-disabled-123",
+        uploads_dir=str(tmp_path),
+        real_apply_enabled=False,
+    )
+
+    assert report.status == "dry_run"
+    assert "REAL_APPLY_ENABLED=false" in (report.blocker_reason or "")
+
+
 def test_llm_mapping_discards_invalid_keys_and_generated_values() -> None:
     mapped = _parse_mapping_output(
         '{"Notice period?":"notice_period","Email":"an invented answer",'
@@ -269,3 +357,27 @@ def test_llm_mapping_discards_invalid_keys_and_generated_values() -> None:
     )
 
     assert mapped == {"Notice period?": "notice_period"}
+
+
+@pytest.mark.asyncio
+async def test_domain_and_session_real_application_rate_limits() -> None:
+    first = await autofill._reserve_run("example.test", "session-rate-123", "review")
+    immediate_retry = await autofill._reserve_run(
+        "example.test", "another-session-123", "review"
+    )
+
+    assert first is None
+    assert immediate_retry is not None
+    assert "rate-limited" in immediate_retry
+
+    autofill._DOMAIN_RUNS.clear()
+    for index in range(5):
+        result = await autofill._reserve_run(
+            f"domain-{index}.test", "session-rate-123", "submit"
+        )
+        assert result is None
+    capped = await autofill._reserve_run(
+        "sixth-domain.test", "session-rate-123", "submit"
+    )
+    assert capped is not None
+    assert "five real application attempts" in capped

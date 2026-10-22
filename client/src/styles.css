@@ -48,6 +48,7 @@ button { cursor: pointer; }
 
 .chat-panel { background: #fff; display: flex; flex-direction: column; height: 100vh; min-width: 0; }
 .chat-header { align-items: center; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; min-height: 76px; padding: 0 clamp(20px, 4vw, 56px); }
+.header-actions { align-items: center; display: flex; gap: 8px; }
 .header-assistant { align-items: center; display: flex; gap: 11px; }
 .assistant-mark { align-items: center; background: #eeeaff; border-radius: 12px; color: #7565d7; display: flex; flex: 0 0 auto; font-size: 19px; height: 39px; justify-content: center; width: 39px; }
 .header-assistant strong { display: block; font-size: 12px; }

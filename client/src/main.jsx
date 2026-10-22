@@ -18,6 +18,8 @@ const TOOL_LABELS = {
   recommend_jobs: "Job matching",
   get_job_details: "Job details",
   apply_to_job: "Application recorded",
+  generate_cover_letter: "Cover letter draft",
+  approve_cover_letter: "Cover letter approved",
   list_applications: "Application history"
 };
 const APPLICATION_STATUS_LABELS = {
@@ -405,6 +407,29 @@ function App() {
     }
   }
 
+  async function clearSession() {
+    if (busy || !window.confirm("Clear this session, including your saved profile and previews?")) return;
+    setError("");
+    setBusy(true);
+    try {
+      const response = await fetch(
+        `/api/session?session_id=${encodeURIComponent(SESSION_ID)}`,
+        { method: "DELETE" }
+      );
+      if (!response.ok) await responseJson(response);
+      setMessages([{
+        id: "welcome",
+        role: "assistant",
+        content: "Hi, I’m **AIJob**. Upload your resume and I’ll help you find roles that fit, refine your search, and keep track of applications."
+      }]);
+      setInput("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -434,9 +459,14 @@ function App() {
             <div className="assistant-mark">✳</div>
             <div><strong>AIJob Assistant</strong><span><i /> Here to help with your search</span></div>
           </div>
-          <button className="header-action" onClick={() => sendMessage("Show my applied jobs")}>
-            <span>▤</span> My applications
-          </button>
+          <div className="header-actions">
+            <button className="header-action" onClick={() => sendMessage("Show my applied jobs")}>
+              <span>▤</span> My applications
+            </button>
+            <button className="header-action" onClick={clearSession} disabled={busy}>
+              Clear session
+            </button>
+          </div>
         </header>
 
         <div className="conversation">

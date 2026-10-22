@@ -24,6 +24,12 @@ from server.app.tools.applications import (
     apply_to_job_tool,
 )
 from server.app.tools.application_answers import SAVE_APPLICATION_ANSWERS_DEFINITION
+from server.app.tools.application_documents import (
+    APPROVE_COVER_LETTER_DEFINITION,
+    GENERATE_COVER_LETTER_DEFINITION,
+    ApproveCoverLetterInput,
+    approve_cover_letter_tool,
+)
 from server.app.tools.base import ToolContext, ToolDefinition
 from server.app.config import Settings, get_settings
 from server.app.tools.jobs import (
@@ -57,6 +63,8 @@ For filters, preserve earlier active filters unless the user asks to remove or r
 When a user provides an application answer such as work authorization, salary, relocation, notice
 period, availability, or EEO information, save only the answer they explicitly stated with
 save_application_answers. Never infer or invent application answers.
+Generate cover letters only when asked; show the generated draft and require explicit approval
+before including it in any application.
 An application is submitted only when apply_to_job returns status submitted. For dry_run, say that
 submission is disabled and nothing was sent. For review_ready, say that the form is filled but NOT
 submitted. For needs_input, ask for the listed missing answers in one batch. For needs_manual,
@@ -71,6 +79,8 @@ TOOL_DEFINITIONS = [
     APPLY_DEFINITION,
     LIST_DEFINITION,
     SAVE_APPLICATION_ANSWERS_DEFINITION,
+    GENERATE_COVER_LETTER_DEFINITION,
+    APPROVE_COVER_LETTER_DEFINITION,
 ]
 CONFIRMATION_PHRASES = {
     "yes",
@@ -107,6 +117,17 @@ def _is_explicit_confirmation(message: str) -> bool:
 
 def _is_explicit_rejection(message: str) -> bool:
     return _normalized_short_reply(message) in REJECTION_PHRASES
+
+
+def _is_explicit_cover_letter_approval(message: str) -> bool:
+    return _normalized_short_reply(message) in {
+        "approve",
+        "approve it",
+        "approve the cover letter",
+        "approve this cover letter",
+        "use this cover letter",
+        "use it",
+    }
 
 
 class ChatModel(Protocol):
@@ -192,6 +213,25 @@ class Orchestrator:
             state.pending_submission_job_id = None
             pending_reply = "Understood. I cancelled the application; nothing was submitted."
             return ChatResponse(reply=pending_reply, profile=state.profile)
+        if (
+            state.pending_cover_letter_job_id
+            and _is_explicit_cover_letter_approval(message)
+        ):
+            approved_job_id = state.pending_cover_letter_job_id
+            approved = await approve_cover_letter_tool(
+                context,
+                ApproveCoverLetterInput(job_id=approved_job_id),
+            )
+            return ChatResponse(
+                reply=str(approved["message"]),
+                tool_calls=[
+                    ToolCall(
+                        name="approve_cover_letter",
+                        arguments={"job_id": approved_job_id},
+                    )
+                ],
+                profile=state.profile,
+            )
         contents: list[Any] = [message]
         calls_for_response: list[ToolCall] = []
         displayed_jobs: list[JobRecommendation] | None = None
@@ -311,6 +351,23 @@ class Orchestrator:
                             rerun
                         )
                         reply = str(rerun["message"])
+                    terminal_tool_result = True
+                    break
+                if call.name == "generate_cover_letter":
+                    if tool_output.get("status") == "draft_ready":
+                        reply = (
+                            f"Draft cover letter for {tool_output['title']} at "
+                            f"{tool_output['company']} (not approved):\n\n"
+                            f"{tool_output['cover_letter']}\n\n"
+                            "Review it and say “approve the cover letter” if you want it "
+                            "included for this job. It will not be submitted."
+                        )
+                    else:
+                        reply = str(tool_output["message"])
+                    terminal_tool_result = True
+                    break
+                if call.name == "approve_cover_letter":
+                    reply = str(tool_output["message"])
                     terminal_tool_result = True
                     break
                 contents.append(self.model.format_tool_response(call, tool_output))

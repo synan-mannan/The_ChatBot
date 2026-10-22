@@ -159,6 +159,8 @@ async def _run_generic_autofill(
         session_id=context.session_id,
         uploads_dir=context.settings.uploads_dir,
         model=context.model,
+        real_apply_enabled=context.settings.real_apply_enabled,
+        approved_cover_letter=context.state.approved_cover_letters.get(job.id),
     )
     output = _autofill_output(context, job, application, report)
     await context.db_session.commit()

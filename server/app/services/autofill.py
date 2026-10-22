@@ -7,11 +7,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, RootModel, ValidationError
 
+from server.app.config import get_settings
 from server.app.models.schemas import Job, ResumeProfile
 
 AutofillMode = Literal["dry_run", "review", "submit"]
@@ -49,6 +50,10 @@ ALLOWED_ANSWER_KEYS = {
     "ethnicity",
     "disability_status",
     "veteran_status",
+    "criminal_history",
+    "terms_consent",
+    "privacy_consent",
+    "legal_attestation",
 }
 ALLOWED_MAPPING_KEYS = ALLOWED_PROFILE_KEYS | ALLOWED_ANSWER_KEYS
 FORM_TIMEOUT_SECONDS = 30
@@ -58,6 +63,10 @@ SESSION_HOUR = timedelta(hours=1)
 _RATE_LIMIT_LOCK = asyncio.Lock()
 _DOMAIN_RUNS: dict[str, datetime] = {}
 _SESSION_SUBMISSIONS: dict[str, list[datetime]] = {}
+
+
+def clear_session_rate_limits(session_id: str) -> None:
+    _SESSION_SUBMISSIONS.pop(session_id, None)
 
 
 class FilledField(BaseModel):
@@ -107,6 +116,50 @@ class FormField:
 
 class FieldMappingError(RuntimeError):
     """The optional AI field-mapping response could not be validated."""
+
+
+class CoverLetterGenerationError(RuntimeError):
+    """The configured model could not draft a cover letter."""
+
+
+async def generate_cover_letter(
+    profile: ResumeProfile, job: Job, model: Any
+) -> str:
+    experience_years = (
+        profile.total_experience_years
+        if profile.total_experience_years is not None
+        else profile.experience_years
+    )
+    candidate_facts = {
+        "name": profile.name,
+        "current_title": profile.current_title or profile.designation,
+        "current_company": profile.current_company,
+        "experience_years": experience_years,
+        "experience_summary": profile.experience_summary,
+        "skills": profile.skills,
+        "education": profile.education,
+        "projects": profile.projects,
+    }
+    prompt = (
+        "Draft a concise cover letter for the job using only explicit facts from the "
+        "candidate profile and the supplied job description. Do not invent experience, "
+        "achievements, qualifications, or contact details. Return only the letter text.\n"
+        f"JOB TITLE: {job.title}\nCOMPANY: {job.company}\n"
+        f"JOB DESCRIPTION:\n{job.description}\n"
+        f"CANDIDATE PROFILE FACTS:\n{json.dumps(candidate_facts, ensure_ascii=False)}"
+    )
+    turn = await model.generate_chat(
+        contents=[prompt],
+        tools=[],
+        system_instruction=(
+            "Write a professional cover letter using only the provided job details and "
+            "candidate facts. Do not claim it has been approved or submitted."
+        ),
+    )
+    draft = turn.text.strip()
+    if not draft:
+        raise CoverLetterGenerationError("The AI did not return a cover letter draft.")
+    return draft
 
 
 def _normalize(value: str) -> str:
@@ -169,6 +222,10 @@ def _deterministic_key(field: FormField) -> str | None:
         ("ethnicity", (r"\b(ethnicity|race)\b",)),
         ("disability_status", (r"\b(disability|disabled)\b",)),
         ("veteran_status", (r"\bveteran\b",)),
+        ("criminal_history", (r"\b(convicted|criminal history|felony)\b",)),
+        ("terms_consent", (r"\bterms of (?:service|use)\b",)),
+        ("privacy_consent", (r"\bprivacy (?:policy|notice|terms)\b",)),
+        ("legal_attestation", (r"\b(attest|legal declaration)\b",)),
         ("name", (r"\b(full|preferred) name\b", r"^name$")),
     )
     for key, patterns in rules:
@@ -231,8 +288,6 @@ def _value_for_key(
 ) -> str | None:
     if key == "resume_path":
         return resume_path
-    if key == "cover_letter":
-        return None
     if key in ALLOWED_ANSWER_KEYS:
         value = answers.get(key)
         return str(value) if value is not None else None
@@ -472,6 +527,7 @@ async def _fill_fields(
     profile: ResumeProfile,
     answers: dict[str, str | bool | float],
     resume_path: str | None,
+    approved_cover_letter: str | None,
 ) -> tuple[list[FilledField], list[NeedsInputField]]:
     filled: list[FilledField] = []
     needs_input: list[NeedsInputField] = []
@@ -490,15 +546,32 @@ async def _fill_fields(
                         needs_input.append(_needs_input(field_info))
                     else:
                         filled.append(FilledField(label=field_info.label, key=key))
+                elif isinstance(answer, str):
+                    checked = _checkbox_answer(field_info, answer)
+                    if checked is None:
+                        needs_input.append(_needs_input(field_info))
+                    elif checked:
+                        await field_info.controls[0].check(timeout=ACTION_TIMEOUT_MS)
+                        filled.append(FilledField(label=field_info.label, key=key))
+                    else:
+                        await field_info.controls[0].uncheck(timeout=ACTION_TIMEOUT_MS)
+                        if field_info.required:
+                            needs_input.append(_needs_input(field_info))
+                        else:
+                            filled.append(FilledField(label=field_info.label, key=key))
                 else:
                     needs_input.append(_needs_input(field_info))
             else:
                 needs_input.append(_needs_input(field_info))
             continue
-        if key == "cover_letter":
+        if key == "cover_letter" and not approved_cover_letter:
             needs_input.append(_needs_input(field_info))
             continue
-        value = _value_for_key(key, profile, answers, resume_path) if key else None
+        value = (
+            approved_cover_letter
+            if key == "cover_letter"
+            else _value_for_key(key, profile, answers, resume_path) if key else None
+        )
         if field_info.field_type == "file":
             if value and Path(value).is_file():
                 await field_info.controls[0].set_input_files(value, timeout=ACTION_TIMEOUT_MS)
@@ -540,6 +613,33 @@ async def _fill_fields(
         elif field_info.required or field_info.field_type == "textarea" or sensitive:
             needs_input.append(_needs_input(field_info))
     return filled, needs_input
+
+
+def _checkbox_answer(field_info: FormField, answer: str) -> bool | None:
+    normalized_answer = _normalize(answer)
+    affirmative = {
+        "yes",
+        "true",
+        "agree",
+        "i agree",
+        "authorized",
+        "i am",
+        "opt in",
+    }
+    negative = {
+        "no",
+        "false",
+        "disagree",
+        "i do not agree",
+        "not applicable",
+        "prefer not to say",
+        "opt out",
+    }
+    if normalized_answer in affirmative:
+        return True
+    if normalized_answer in negative:
+        return False
+    return normalized_answer == _normalize(field_info.label)
 
 
 async def _required_fields_missing(fields: list[FormField]) -> list[NeedsInputField]:
@@ -640,7 +740,11 @@ async def fill_application_form(
     session_id: str = "local-session",
     uploads_dir: str = "uploads",
     model: Any | None = None,
+    real_apply_enabled: bool | None = None,
     headed: bool = False,
+    approved_cover_letter: str | None = None,
+    keep_open: bool = False,
+    on_report: Callable[[AutofillReport], None] | None = None,
 ) -> AutofillReport:
     parsed_url = urlsplit(url)
     hostname = parsed_url.hostname or ""
@@ -652,6 +756,10 @@ async def fill_application_form(
             blocker_reason="This career portal does not permit automated applications. Continue manually.",
             final_url=url,
         )
+    if real_apply_enabled is None:
+        real_apply_enabled = get_settings().real_apply_enabled
+    if mode == "submit" and not real_apply_enabled:
+        mode = "dry_run"
     if not _safe_file_component(session_id) or not _safe_file_component(job.id):
         return AutofillReport(
             status="failed",
@@ -703,7 +811,12 @@ async def fill_application_form(
                     break
                 mapping = await _field_mapping(fields, model)
                 filled, missing = await _fill_fields(
-                    fields, mapping, profile, answers, resume_path
+                    fields,
+                    mapping,
+                    profile,
+                    answers,
+                    resume_path,
+                    approved_cover_letter,
                 )
                 all_filled.extend(filled)
                 all_needs_input.extend(missing)
@@ -739,6 +852,10 @@ async def fill_application_form(
                 return report
             if mode == "dry_run":
                 report.status = "dry_run"
+                if not real_apply_enabled:
+                    report.blocker_reason = (
+                        "REAL_APPLY_ENABLED=false; the form was not submitted."
+                    )
                 return report
             if mode == "review":
                 report.status = "review_ready"
@@ -770,15 +887,25 @@ async def fill_application_form(
         )
         return report
     finally:
-        if browser is not None:
-            try:
-                await browser.close()
-            except Exception:
-                report.status = "failed"
-                report.blocker_reason = "The browser could not close cleanly; verify manually."
-        if playwright is not None:
-            try:
-                await playwright.stop()
-            except Exception:
-                report.status = "failed"
-                report.blocker_reason = "The browser driver could not stop cleanly; verify manually."
+        try:
+            if keep_open:
+                if on_report is not None:
+                    on_report(report)
+                if browser is not None:
+                    try:
+                        await asyncio.to_thread(input, "Press Enter to close the browser...")
+                    except EOFError:
+                        pass
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    report.status = "failed"
+                    report.blocker_reason = "The browser could not close cleanly; verify manually."
+            if playwright is not None:
+                try:
+                    await playwright.stop()
+                except Exception:
+                    report.status = "failed"
+                    report.blocker_reason = "The browser driver could not stop cleanly; verify manually."

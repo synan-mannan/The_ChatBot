@@ -18,6 +18,7 @@
     });
     document.querySelector("#application").addEventListener("submit", event => {
       event.preventDefault();
+      window.location.hash = "submitted";
       document.querySelector("#confirmation").hidden = false;
     });
   </script>

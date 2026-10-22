@@ -19,6 +19,10 @@ ALLOWED_ANSWER_KEYS = {
     "ethnicity",
     "disability_status",
     "veteran_status",
+    "criminal_history",
+    "terms_consent",
+    "privacy_consent",
+    "legal_attestation",
 }
 
 
@@ -48,6 +52,7 @@ async def save_application_answers_tool(
             session_id=context.session_id,
             profile_data={},
             answers_data=dict(context.state.answers),
+            approved_cover_letters_data={},
         )
         context.db_session.add(row)
     else:

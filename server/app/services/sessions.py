@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,6 +13,9 @@ from server.app.models.schemas import JobFilters, JobRecommendation, ResumeProfi
 class SessionState:
     profile: ResumeProfile | None = None
     answers: dict[str, str | bool | float] = field(default_factory=dict)
+    approved_cover_letters: dict[str, str] = field(default_factory=dict)
+    pending_cover_letter_job_id: str | None = None
+    pending_cover_letter: str | None = None
     resume_path: str | None = None
     filters: JobFilters = field(default_factory=JobFilters)
     last_shown_jobs: list[JobRecommendation] = field(default_factory=list)
@@ -50,6 +54,16 @@ class SessionStore:
         state = self.get(session_id)
         state.last_shown_jobs = jobs
         return state
+
+    def clear(self, session_id: str, uploads_dir: str) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", session_id):
+            raise ValueError("The session ID contains unsupported characters.")
+        uploads_root = Path(uploads_dir).resolve()
+        session_directory = (uploads_root / session_id).resolve()
+        session_directory.relative_to(uploads_root)
+        self._sessions.pop(session_id, None)
+        if session_directory.is_dir():
+            shutil.rmtree(session_directory)
 
 
 async def restore_resume_path(

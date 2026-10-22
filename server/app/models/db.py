@@ -35,6 +35,9 @@ class ResumeProfileRow(Base):
     session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     profile_data: Mapped[dict] = mapped_column(JSON, nullable=False)
     answers_data: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    approved_cover_letters_data: Mapped[dict] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
@@ -117,6 +120,10 @@ def _migrate_resume_profile_columns(connection: Any) -> None:
     if "answers_data" not in columns:
         connection.exec_driver_sql(
             "ALTER TABLE resume_profiles ADD COLUMN answers_data JSON NOT NULL DEFAULT '{}'"
+        )
+    if "approved_cover_letters_data" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE resume_profiles ADD COLUMN approved_cover_letters_data JSON NOT NULL DEFAULT '{}'"
         )
 
 

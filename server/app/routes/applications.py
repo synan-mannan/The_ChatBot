@@ -3,10 +3,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Path as PathParam, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path as PathParam, Query, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import StringConstraints
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing_extensions import Annotated
 
@@ -21,12 +21,34 @@ from server.app.models.schemas import (
 )
 from server.app.routes.dependencies import get_database_session
 from server.app.services.sessions import SessionStore, restore_resume_path
+from server.app.services.autofill import clear_session_rate_limits
 from server.app.tools.applications import ApplyToJobInput, apply_to_job_tool
 from server.app.tools.base import ToolContext
 
 router = APIRouter(prefix="/api", tags=["applications"])
 SessionQuery = Annotated[str, StringConstraints(min_length=8, max_length=128)]
 JobPath = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,128}$")]
+
+
+@router.delete("/session", status_code=204)
+async def clear_session(
+    request: Request,
+    session_id: SessionQuery = Query(...),
+    session: AsyncSession = Depends(get_database_session),
+) -> Response:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", session_id):
+        raise HTTPException(status_code=400, detail="The session ID contains unsupported characters.")
+    store: SessionStore = request.app.state.session_store
+    store.clear(session_id, request.app.state.settings.uploads_dir)
+    clear_session_rate_limits(session_id)
+    await session.execute(
+        delete(ApplicationRow).where(ApplicationRow.session_id == session_id)
+    )
+    profile_row = await session.get(ResumeProfileRow, session_id)
+    if profile_row is not None:
+        await session.delete(profile_row)
+    await session.commit()
+    return Response(status_code=204)
 
 
 @router.post("/applications/apply", response_model=ApplicationActionResponse)
@@ -41,6 +63,9 @@ async def apply_to_job(
         profile_row = await session.get(ResumeProfileRow, body.session_id)
         if profile_row is not None:
             state.answers = profile_row.answers_data or {}
+            state.approved_cover_letters = (
+                profile_row.approved_cover_letters_data or {}
+            )
             if profile_row.profile_data:
                 state.profile = ResumeProfile.model_validate(profile_row.profile_data)
     if state.profile is not None:
@@ -124,6 +149,7 @@ async def list_applications(
             )
         state.profile = ResumeProfile.model_validate(profile_row.profile_data)
         state.answers = profile_row.answers_data or {}
+        state.approved_cover_letters = profile_row.approved_cover_letters_data or {}
     await restore_resume_path(
         state, session_id, request.app.state.settings.uploads_dir
     )
