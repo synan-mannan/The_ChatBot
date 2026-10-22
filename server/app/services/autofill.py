@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,12 @@ from server.app.models.schemas import Job, ResumeProfile
 
 AutofillMode = Literal["dry_run", "review", "submit"]
 BLOCKED_DOMAINS = {"linkedin.com", "indeed.com", "naukri.com", "glassdoor.com"}
+AGGREGATOR_DOMAINS = {
+    "remotive.com",
+    "remoteok.com",
+    "jobicy.com",
+    "himalayas.app",
+}
 ALLOWED_PROFILE_KEYS = {
     "first_name",
     "last_name",
@@ -63,6 +70,7 @@ SESSION_HOUR = timedelta(hours=1)
 _RATE_LIMIT_LOCK = asyncio.Lock()
 _DOMAIN_RUNS: dict[str, datetime] = {}
 _SESSION_SUBMISSIONS: dict[str, list[datetime]] = {}
+logger = logging.getLogger(__name__)
 
 
 def clear_session_rate_limits(session_id: str) -> None:
@@ -95,6 +103,12 @@ class AutofillReport(BaseModel):
     blocker_reason: str | None = None
     screenshot_path: str | None = None
     final_url: str | None = None
+    detected_ats: Literal[
+        "greenhouse", "lever", "ashby", "workable", "smartrecruiters", "workday", "other"
+    ] = "other"
+    debug_screenshot_path: str | None = None
+    discovered_form_labels: list[str] = []
+    debug_labels_path: str | None = None
 
 
 class MappingOutput(RootModel[dict[str, str | None]]):
@@ -112,6 +126,9 @@ class FormField:
     required: bool
     options: list[tuple[str, str]] = field(default_factory=list)
     metadata: str = ""
+    form_key: str = "page"
+    form_metadata: str = ""
+    visible: bool = True
 
 
 class FieldMappingError(RuntimeError):
@@ -192,6 +209,10 @@ def _parse_mapping_output(raw: str) -> dict[str, str]:
 
 
 def _deterministic_key(field: FormField) -> str | None:
+    if field.field_type == "file" and re.search(
+        r"\b(resume|cv|pdf|docx?)\b", field.metadata, re.I
+    ):
+        return "resume_path"
     label = _normalize(" ".join((field.label, field.name, field.field_id, field.metadata)))
     rules: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("resume_path", (r"\b(resume|cv|curriculum vitae)\b",)),
@@ -232,6 +253,121 @@ def _deterministic_key(field: FormField) -> str | None:
         if any(re.search(pattern, label) for pattern in patterns):
             return key
     return None
+
+
+def _detected_ats(url: str) -> Literal[
+    "greenhouse", "lever", "ashby", "workable", "smartrecruiters", "workday", "other"
+]:
+    host = (urlsplit(url).hostname or "").casefold()
+    for vendor, domains in (
+        ("greenhouse", ("greenhouse.io",)),
+        ("lever", ("lever.co",)),
+        ("ashby", ("ashbyhq.com",)),
+        ("workable", ("workable.com",)),
+        ("smartrecruiters", ("smartrecruiters.com",)),
+        ("workday", ("myworkdayjobs.com", "workday.com")),
+    ):
+        if any(host == domain or host.endswith(f".{domain}") for domain in domains):
+            return vendor  # type: ignore[return-value]
+    return "other"
+
+
+def _registrable_domain(host: str) -> str:
+    labels = host.casefold().rstrip(".").split(".")
+    if len(labels) < 2:
+        return host.casefold()
+    common_compound_suffixes = {
+        "co.uk", "com.au", "co.nz", "co.in", "com.br", "com.mx", "co.jp"
+    }
+    suffix = ".".join(labels[-2:])
+    return ".".join(labels[-3:]) if suffix in common_compound_suffixes and len(labels) > 2 else suffix
+
+
+def _is_aggregator(host: str) -> bool:
+    domain = _registrable_domain(host)
+    return domain.startswith("arbeitnow.") or domain in AGGREGATOR_DOMAINS
+
+
+_NON_APPLICATION_FORM = re.compile(
+    r"newsletter|subscribe|job alert|get notified|search|login|log in|sign in|"
+    r"cookie|comment",
+    re.I,
+)
+_APPLY_CONTROL = re.compile(
+    r"^\s*apply(?:\s+now|\s+for this job|\s+on (?:the )?company(?: site)?|\s+here)?\s*$",
+    re.I,
+)
+_PROFILE_FORM_KEYS = ALLOWED_PROFILE_KEYS - {
+    "cover_letter", "current_company", "current_title", "total_experience_years",
+    "experience_years", "highest_education", "college", "graduation_year",
+}
+
+
+def is_application_form(fields: list[FormField]) -> bool:
+    if not fields or not any(field.visible for field in fields):
+        return False
+    description = " ".join(
+        " ".join(
+            (
+                field.form_metadata,
+                field.label,
+                field.name,
+                field.field_id,
+                field.metadata,
+            )
+        )
+        for field in fields
+    )
+    if _NON_APPLICATION_FORM.search(description):
+        return False
+    file_upload = any(
+        field.field_type == "file"
+        and _deterministic_key(field) == "resume_path"
+        for field in fields
+    )
+    mapped_profile_fields = [
+        field
+        for field in fields
+        if _deterministic_key(field) in _PROFILE_FORM_KEYS
+    ]
+    return file_upload or len(mapped_profile_fields) >= 3
+
+
+async def _application_form_fields(frames: list[Any]) -> tuple[list[FormField], list[FormField]]:
+    discovered = await _discover_fields(frames)
+    grouped: dict[tuple[int, str], list[FormField]] = {}
+    for field_info in discovered:
+        grouped.setdefault(
+            (id(field_info.frame), field_info.form_key), []
+        ).append(field_info)
+    candidates = [group for group in grouped.values() if is_application_form(group)]
+    labels = [field_info.label for field_info in discovered]
+    if not candidates:
+        return [], discovered
+    candidates.sort(
+        key=lambda group: (
+            any(
+                field_info.field_type == "file"
+                and _deterministic_key(field_info) == "resume_path"
+                for field_info in group
+            ),
+            len(
+                [
+                    field_info
+                    for field_info in group
+                    if _deterministic_key(field_info) in _PROFILE_FORM_KEYS
+                ]
+            ),
+        ),
+        reverse=True,
+    )
+    selected = candidates[0]
+    logger.info(
+        "autofill form selected: fields=%d resume_upload=%s",
+        len(selected),
+        any(field_info.field_type == "file" for field_info in selected),
+    )
+    return selected, discovered
 
 
 def _sensitive_question(field: FormField) -> bool:
@@ -378,8 +514,7 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
         radio_groups: dict[str, list[tuple[Any, dict[str, Any]]]] = {}
         for index in range(count):
             control = controls.nth(index)
-            if not await control.is_visible():
-                continue
+            visible = await control.is_visible()
             info = await control.evaluate(
                 """element => {
                   const text = node => (node?.innerText || node?.textContent || '').trim();
@@ -400,10 +535,26 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
                     value: element.value || '',
                     name: element.getAttribute('name') || '',
                     id: element.id || '',
+                    accept: element.getAttribute('accept') || '',
                     label: labels[0] || element.getAttribute('aria-label') ||
                       element.getAttribute('placeholder') || text(fieldset?.querySelector('legend')) ||
                       preceding || '',
                     group: text(fieldset?.querySelector('legend')) || '',
+                    formKey: element.closest('form')
+                      ? `form-${Array.from(document.forms).indexOf(element.closest('form'))}`
+                      : 'page',
+                    formMetadata: element.closest('form')
+                      ? [
+                          text(element.closest('form')),
+                          element.closest('form').id,
+                          element.closest('form').className,
+                          element.closest('form').getAttribute('action') || '',
+                          Array.from(element.closest('form').querySelectorAll(
+                            'button, input[type="submit"]'
+                          )).map(button => text(button) || button.value || '').join(' ')
+                        ].join(' ')
+                      : '',
+                    visible: true,
                     required: element.required || element.getAttribute('aria-required') === 'true',
                     options: element.tagName.toLowerCase() === 'select'
                       ? Array.from(element.options).map(option => ({
@@ -412,6 +563,7 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
                   };
                 }"""
             )
+            info["visible"] = visible
             field_type = str(info["type"])
             if field_type in {"submit", "button", "reset", "hidden", "image"}:
                 continue
@@ -434,7 +586,12 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
                     field_type=field_type,
                     required=bool(info["required"]),
                     options=options,
-                    metadata=str(info["group"]),
+                    metadata=" ".join(
+                        value for value in (str(info["group"]), str(info["accept"])) if value
+                    ),
+                    form_key=str(info["formKey"]),
+                    form_metadata=str(info["formMetadata"]),
+                    visible=bool(info["visible"]),
                 )
             )
         for name, group_items in radio_groups.items():
@@ -457,6 +614,11 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
                     required=any(bool(item["required"]) for _, item in group_items),
                     options=options,
                     metadata=" ".join(label for label, _ in options),
+                    form_key=str(first["formKey"]),
+                    form_metadata=str(first["formMetadata"]),
+                    visible=any(
+                        bool(item["visible"]) for _, item in group_items
+                    ),
                 )
             )
     return fields
@@ -496,20 +658,101 @@ async def _blocker_reason(frames: list[Any], url: str) -> str | None:
     return None
 
 
-async def _click_apply_if_needed(page: Any, frames: list[Any]) -> list[Any]:
-    if await _discover_fields(frames):
-        return frames
-    pattern = re.compile(r"^\s*apply(?:\s+now)?(?:\s+for\s+this\s+job)?\s*$", re.I)
+async def _wait_for_destination(page: Any) -> Any:
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+    except PlaywrightTimeoutError:
+        pass
+    try:
+        await page.wait_for_load_state("networkidle", timeout=3_000)
+    except PlaywrightTimeoutError:
+        pass
+    return page
+
+
+async def _activate_apply_control(page: Any, frames: list[Any]) -> Any | None:
+    candidates: list[tuple[bool, Any, str | None]] = []
     for frame in frames:
-        for role in ("button", "link"):
-            candidates = frame.get_by_role(role, name=pattern)
-            for index in range(await candidates.count()):
-                candidate = candidates.nth(index)
-                if await candidate.is_visible():
-                    await candidate.click(timeout=ACTION_TIMEOUT_MS)
-                    await page.wait_for_timeout(500)
-                    return list(page.frames)
-    return frames
+        for role in ("link", "button"):
+            controls = frame.get_by_role(role, name=_APPLY_CONTROL)
+            for index in range(await controls.count()):
+                control = controls.nth(index)
+                if not await control.is_visible():
+                    continue
+                href = await control.get_attribute("href") if role == "link" else None
+                external = False
+                if href:
+                    target_host = urlsplit(href).hostname
+                    current_host = urlsplit(page.url).hostname
+                    external = bool(
+                        target_host
+                        and current_host
+                        and _registrable_domain(target_host)
+                        != _registrable_domain(current_host)
+                    )
+                candidates.append((external, control, href))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, control, href = candidates[0]
+    if href and urlsplit(href).scheme in {"http", "https"}:
+        await page.goto(href, wait_until="domcontentloaded", timeout=30_000)
+        logger.info("autofill hop via external apply link: host=%s", urlsplit(page.url).hostname)
+        return await _wait_for_destination(page)
+
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+    context = page.context
+    try:
+        async with context.expect_page(timeout=1_500) as page_info:
+            await control.click(timeout=ACTION_TIMEOUT_MS)
+        destination = await page_info.value
+        logger.info("autofill hop via new page: host=%s", urlsplit(destination.url).hostname)
+        return await _wait_for_destination(destination)
+    except PlaywrightTimeoutError:
+        await _wait_for_destination(page)
+        logger.info("autofill hop via same page: host=%s", urlsplit(page.url).hostname)
+        return page
+
+
+async def _resolve_application_entry(
+    page: Any,
+) -> tuple[Any, list[FormField], list[FormField], str | None]:
+    for hop in range(5):
+        if hop == 0 and _is_aggregator(urlsplit(page.url).hostname or ""):
+            logger.info("autofill aggregator listing detected: host=%s", urlsplit(page.url).hostname)
+        frames = list(page.frames)
+        fields, discovered = await _application_form_fields(frames)
+        reason = await _blocker_reason(frames, page.url)
+        if reason:
+            logger.info(
+                "autofill stopped at hop=%d reason=%s host=%s",
+                hop,
+                reason,
+                urlsplit(page.url).hostname,
+            )
+            return page, [], discovered, reason
+        if fields:
+            logger.info(
+                "autofill application form found at hop=%d host=%s",
+                hop,
+                urlsplit(page.url).hostname,
+            )
+            return page, fields, discovered, None
+        if hop == 4:
+            break
+        destination = await _activate_apply_control(page, frames)
+        if destination is None:
+            break
+        page = destination
+    reason = f"No application form found on {page.url}"
+    logger.info(
+        "autofill stopped: reason=no_application_form host=%s",
+        urlsplit(page.url).hostname,
+    )
+    return page, [], await _discover_fields(list(page.frames)), reason
 
 
 def _needs_input(field_info: FormField) -> NeedsInputField:
@@ -532,6 +775,8 @@ async def _fill_fields(
     filled: list[FilledField] = []
     needs_input: list[NeedsInputField] = []
     for field_info in fields:
+        if not field_info.visible:
+            continue
         key = mapping.get(field_info.label) or _deterministic_key(field_info)
         sensitive = _sensitive_question(field_info)
         if field_info.field_type == "checkbox":
@@ -645,7 +890,7 @@ def _checkbox_answer(field_info: FormField, answer: str) -> bool | None:
 async def _required_fields_missing(fields: list[FormField]) -> list[NeedsInputField]:
     missing: list[NeedsInputField] = []
     for field_info in fields:
-        if not field_info.required:
+        if not field_info.visible or not field_info.required:
             continue
         if field_info.field_type == "radio":
             empty = not any(
@@ -664,30 +909,43 @@ async def _required_fields_missing(fields: list[FormField]) -> list[NeedsInputFi
     return missing
 
 
-async def _next_button(frames: list[Any]) -> Any | None:
+def _form_scope(field_info: FormField) -> Any:
+    if not field_info.form_key.startswith("form-"):
+        return field_info.frame
+    try:
+        form_index = int(field_info.form_key.removeprefix("form-"))
+    except ValueError:
+        return field_info.frame
+    return field_info.frame.locator("form").nth(form_index)
+
+
+async def _next_button(fields: list[FormField]) -> Any | None:
     pattern = re.compile(r"^\s*(next|continue)(?:\s+to\s+\w+)?\s*$", re.I)
-    for frame in frames:
-        for role in ("button", "link"):
-            candidates = frame.get_by_role(role, name=pattern)
-            for index in range(await candidates.count()):
-                candidate = candidates.nth(index)
-                if await candidate.is_visible():
-                    return candidate
+    if not fields:
+        return None
+    scope = _form_scope(fields[0])
+    for role in ("button", "link"):
+        candidates = scope.get_by_role(role, name=pattern)
+        for index in range(await candidates.count()):
+            candidate = candidates.nth(index)
+            if await candidate.is_visible():
+                return candidate
     return None
 
 
-async def _submit_button(frames: list[Any]) -> Any | None:
+async def _submit_button(fields: list[FormField]) -> Any | None:
     pattern = re.compile(r"^\s*(submit|submit application|send application|finish application)\s*$", re.I)
-    for frame in frames:
-        for role in ("button",):
-            candidates = frame.get_by_role(role, name=pattern)
-            for index in range(await candidates.count()):
-                candidate = candidates.nth(index)
-                if await candidate.is_visible():
-                    return candidate
-        candidates = frame.locator('input[type="submit"]')
-        if await candidates.count():
-            return candidates.first
+    if not fields:
+        return None
+    scope = _form_scope(fields[0])
+    candidates = scope.get_by_role("button", name=pattern)
+    for index in range(await candidates.count()):
+        candidate = candidates.nth(index)
+        if await candidate.is_visible():
+            return candidate
+    candidates = scope.locator('input[type="submit"]')
+    if await candidates.count():
+        return candidates.first
     return None
 
 
@@ -706,6 +964,54 @@ async def _confirmation_detected(page: Any) -> bool:
             re.I,
         )
     )
+
+
+def _review_readiness_reason(
+    fields: list[FormField], filled: list[FilledField]
+) -> str | None:
+    if len(filled) < 3:
+        return "Fewer than three application fields were filled."
+    has_resume_input = any(field_info.field_type == "file" for field_info in fields)
+    filled_keys = {field_info.key for field_info in filled}
+    if has_resume_input:
+        if "resume_path" not in filled_keys:
+            return "The resume upload was not completed."
+        return None
+    has_name = "name" in filled_keys or {
+        "first_name", "last_name"
+    }.issubset(filled_keys)
+    if has_name and {"email", "phone"}.issubset(filled_keys):
+        return None
+    return "Without a resume upload, name, email, and phone must all be filled."
+
+
+async def _save_debug_artifacts(
+    page: Any | None,
+    report: AutofillReport,
+    *,
+    uploads_dir: str,
+    session_id: str,
+    job_id: str,
+) -> None:
+    directory = Path(uploads_dir) / session_id / "previews"
+    directory.mkdir(parents=True, exist_ok=True)
+    report.screenshot_path = str(directory / f"{job_id}.png")
+    report.debug_screenshot_path = str(directory / f"{job_id}-debug.png")
+    report.debug_labels_path = str(directory / f"{job_id}-labels.json")
+    try:
+        Path(report.debug_labels_path).write_text(
+            json.dumps(report.discovered_form_labels, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        if page is not None:
+            await page.screenshot(path=report.screenshot_path, full_page=True)
+            await page.screenshot(path=report.debug_screenshot_path, full_page=True)
+    except Exception as exc:
+        logger.warning("autofill debug artifact save failed: %s", type(exc).__name__)
+        report.blocker_reason = (
+            f"{report.blocker_reason or 'Application stopped.'} "
+            f"Debug artifacts could not be saved ({type(exc).__name__})."
+        )
 
 
 async def _reserve_run(domain: str, session_id: str, mode: AutofillMode) -> str | None:
@@ -772,6 +1078,7 @@ async def fill_application_form(
 
     playwright = None
     browser = None
+    page = None
     report = AutofillReport(status="failed", final_url=url)
     try:
         from playwright.async_api import async_playwright
@@ -782,33 +1089,19 @@ async def fill_application_form(
             page = await browser.new_page()
             page.set_default_timeout(ACTION_TIMEOUT_MS)
             await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            frames = list(page.frames)
-            reason = await _blocker_reason(frames, page.url)
+            page, fields, discovered, reason = await _resolve_application_entry(page)
+            report.final_url = page.url
+            report.detected_ats = _detected_ats(page.url)
+            report.discovered_form_labels = [field_info.label for field_info in discovered]
             if reason:
                 report.status = "needs_manual"
                 report.blocker_reason = reason
-                report.final_url = page.url
                 return report
-
-            frames = await _click_apply_if_needed(page, frames)
             all_filled: list[FilledField] = []
             all_needs_input: list[NeedsInputField] = []
-            for _ in range(8):
-                frames = list(page.frames)
-                reason = await _blocker_reason(frames, page.url)
-                if reason:
-                    report.status = "needs_manual"
-                    report.blocker_reason = reason
-                    report.final_url = page.url
-                    return report
-                fields = await _discover_fields(frames)
-                if not fields:
-                    if not all_filled:
-                        report.status = "needs_manual"
-                        report.blocker_reason = "No visible application form fields were found."
-                        report.final_url = page.url
-                        return report
-                    break
+            form_identity = (fields[0].frame.url, fields[0].form_key)
+            form_fields_seen = list(fields)
+            for step in range(8):
                 mapping = await _field_mapping(fields, model)
                 filled, missing = await _fill_fields(
                     fields,
@@ -825,20 +1118,40 @@ async def fill_application_form(
                 for item in all_needs_input:
                     unique_missing[(item.label, item.type)] = item
                 all_needs_input = list(unique_missing.values())
-                next_control = await _next_button(frames)
+                next_control = await _next_button(fields)
                 if next_control is None:
                     break
                 await next_control.click(timeout=ACTION_TIMEOUT_MS)
                 await page.wait_for_timeout(350)
+                reason = await _blocker_reason(list(page.frames), page.url)
+                if reason:
+                    report.status = "needs_manual"
+                    report.blocker_reason = reason
+                    report.final_url = page.url
+                    report.filled = all_filled
+                    report.needs_input = all_needs_input
+                    return report
+                step_fields = await _discover_fields(list(page.frames))
+                fields = [
+                    field_info
+                    for field_info in step_fields
+                    if (field_info.frame.url, field_info.form_key) == form_identity
+                ]
+                form_fields_seen.extend(fields)
+                report.discovered_form_labels.extend(
+                    field_info.label
+                    for field_info in step_fields
+                    if field_info.label not in report.discovered_form_labels
+                )
+                if not fields:
+                    break
             else:
                 report.status = "needs_manual"
                 report.blocker_reason = "The form exceeded the eight-step safety limit."
                 report.final_url = page.url
                 return report
 
-            screenshot_directory = (
-                Path(uploads_dir) / session_id / "previews"
-            )
+            screenshot_directory = Path(uploads_dir) / session_id / "previews"
             screenshot_directory.mkdir(parents=True, exist_ok=True)
             screenshot_path = screenshot_directory / f"{job.id}.png"
             await page.screenshot(path=str(screenshot_path), full_page=True)
@@ -846,9 +1159,15 @@ async def fill_application_form(
             report.needs_input = all_needs_input
             report.screenshot_path = str(screenshot_path)
             report.final_url = page.url
+            report.detected_ats = _detected_ats(page.url)
             if all_needs_input:
                 report.status = "needs_input"
                 report.blocker_reason = "Some answers need your review before submission."
+                return report
+            readiness_reason = _review_readiness_reason(form_fields_seen, all_filled)
+            if readiness_reason:
+                report.status = "needs_manual"
+                report.blocker_reason = readiness_reason
                 return report
             if mode == "dry_run":
                 report.status = "dry_run"
@@ -861,7 +1180,7 @@ async def fill_application_form(
                 report.status = "review_ready"
                 return report
 
-            submit = await _submit_button(list(page.frames))
+            submit = await _submit_button(fields)
             if submit is None:
                 report.status = "failed"
                 report.blocker_reason = "No final submit button was found. Verify the form manually."
@@ -878,6 +1197,8 @@ async def fill_application_form(
     except TimeoutError:
         report.status = "failed"
         report.blocker_reason = "The application page timed out; please verify manually."
+        if page is not None:
+            report.final_url = page.url
         return report
     except Exception as exc:
         report.status = "failed"
@@ -885,9 +1206,21 @@ async def fill_application_form(
             f"The application form could not be completed ({type(exc).__name__}); "
             "please verify manually."
         )
+        if page is not None:
+            report.final_url = page.url
+        logger.warning("autofill run failed: %s", type(exc).__name__)
         return report
     finally:
         try:
+            report.detected_ats = _detected_ats(report.final_url or url)
+            if report.status in {"needs_manual", "failed"} and _safe_file_component(session_id) and _safe_file_component(job.id):
+                await _save_debug_artifacts(
+                    page,
+                    report,
+                    uploads_dir=uploads_dir,
+                    session_id=session_id,
+                    job_id=job.id,
+                )
             if keep_open:
                 if on_report is not None:
                     on_report(report)

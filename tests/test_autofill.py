@@ -20,7 +20,7 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures" / "autofill"
 @pytest.fixture
 def fixture_server():
     handler = partial(SimpleHTTPRequestHandler, directory=str(FIXTURE_DIR))
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server = ThreadingHTTPServer(("0.0.0.0", 0), handler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield f"http://127.0.0.1:{server.server_port}"
@@ -69,7 +69,7 @@ async def test_varied_labels_fill_resume_and_screenshot(fixture_server, tmp_path
         uploads_dir=str(tmp_path / "uploads"),
     )
 
-    assert report.status == "review_ready"
+    assert report.status == "review_ready", report.model_dump()
     assert {item.key for item in report.filled} >= {
         "first_name",
         "last_name",
@@ -80,6 +80,90 @@ async def test_varied_labels_fill_resume_and_screenshot(fixture_server, tmp_path
     }
     assert report.screenshot_path is not None
     assert Path(report.screenshot_path).is_file()
+    assert report.detected_ats == "other"
+
+
+@pytest.mark.asyncio
+async def test_aggregator_follow_external_apply_skips_job_alert_form(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/aggregator.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
+        {},
+        None,
+        "review",
+        _job(url, "aggregator-job"),
+        session_id="session-aggregator",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "review_ready"
+    assert report.final_url is not None
+    assert report.final_url.endswith("/application.html")
+    assert {field.label for field in report.filled} == {
+        "Full name",
+        "Email address",
+        "Phone number",
+    }
+    assert all(field.label != "Enter your email" for field in report.filled)
+
+
+@pytest.mark.asyncio
+async def test_popup_tracking_redirects_and_employer_apply_click(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/redirect_listing.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
+        {},
+        None,
+        "review",
+        _job(url, "popup-job"),
+        session_id="session-popup",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "review_ready"
+    assert report.final_url is not None
+    assert report.final_url.endswith("/employer-apply.html")
+    assert {field.key for field in report.filled} == {"name", "email", "phone"}
+
+
+@pytest.mark.asyncio
+async def test_single_email_listing_is_manual_and_saves_debug_artifacts(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/single_email.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(email="ada@example.test"),
+        {},
+        None,
+        "review",
+        _job(url, "single-email-job"),
+        session_id="session-single-email",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "needs_manual"
+    assert report.blocker_reason == f"No application form found on {url}"
+    assert report.filled == []
+    assert report.final_url == url
+    assert report.screenshot_path and Path(report.screenshot_path).is_file()
+    assert report.debug_screenshot_path and Path(report.debug_screenshot_path).is_file()
+    assert report.debug_labels_path and Path(report.debug_labels_path).is_file()
+    assert report.discovered_form_labels == ["Enter your email"]
 
 
 @pytest.mark.asyncio
@@ -87,7 +171,11 @@ async def test_select_and_radio_answers_match_options(fixture_server, tmp_path) 
     url = f"{fixture_server}/select_radio.html"
     report = await fill_application_form(
         url,
-        ResumeProfile(),
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
         {"notice_period": "30 days", "requires_sponsorship": False},
         None,
         "review",
@@ -98,6 +186,9 @@ async def test_select_and_radio_answers_match_options(fixture_server, tmp_path) 
 
     assert report.status == "review_ready"
     assert {item.key for item in report.filled} == {
+        "name",
+        "email",
+        "phone",
         "notice_period",
         "requires_sponsorship",
     }
@@ -108,7 +199,11 @@ async def test_form_inside_iframe_is_discovered(fixture_server, tmp_path) -> Non
     url = f"{fixture_server}/iframe.html"
     report = await fill_application_form(
         url,
-        ResumeProfile(name="Ada Lovelace", email="ada@example.test"),
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
         {},
         None,
         "review",
@@ -117,14 +212,23 @@ async def test_form_inside_iframe_is_discovered(fixture_server, tmp_path) -> Non
         uploads_dir=str(tmp_path),
     )
 
-    assert report.status == "review_ready"
-    assert {item.key for item in report.filled} == {"first_name", "email"}
+    assert report.status == "review_ready", report.model_dump()
+    assert {item.key for item in report.filled} == {
+        "first_name",
+        "last_name",
+        "email",
+        "phone",
+    }
 
 
 @pytest.mark.asyncio
 async def test_multistep_review_does_not_submit_and_submit_verifies(fixture_server, tmp_path) -> None:
     url = f"{fixture_server}/multistep.html"
-    profile = ResumeProfile(name="Ada Lovelace", email="ada@example.test")
+    profile = ResumeProfile(
+        name="Ada Lovelace",
+        email="ada@example.test",
+        phone="+44 20 1234 5678",
+    )
     review = await fill_application_form(
         url,
         profile,
@@ -135,9 +239,14 @@ async def test_multistep_review_does_not_submit_and_submit_verifies(fixture_serv
         session_id="session-multistep",
         uploads_dir=str(tmp_path),
     )
-    assert review.status == "dry_run"
+    assert review.status == "dry_run", review.model_dump()
     assert "submitted" not in (review.final_url or "")
-    assert {item.key for item in review.filled} == {"first_name", "email"}
+    assert {item.key for item in review.filled} == {
+        "first_name",
+        "last_name",
+        "email",
+        "phone",
+    }
 
     autofill._DOMAIN_RUNS.clear()
     submitted = await fill_application_form(
@@ -186,7 +295,11 @@ async def test_captcha_and_login_are_manual_blockers(
 @pytest.mark.asyncio
 async def test_required_unknown_question_needs_answer_then_fills(fixture_server, tmp_path) -> None:
     url = f"{fixture_server}/unknown.html"
-    profile = ResumeProfile()
+    profile = ResumeProfile(
+        name="Ada Lovelace",
+        email="ada@example.test",
+        phone="+44 20 1234 5678",
+    )
     missing = await fill_application_form(
         url,
         profile,
@@ -212,7 +325,7 @@ async def test_required_unknown_question_needs_answer_then_fills(fixture_server,
         uploads_dir=str(tmp_path),
     )
     assert answered.status == "review_ready"
-    assert answered.filled[0].key == "notice_period"
+    assert "notice_period" in {item.key for item in answered.filled}
 
 
 @pytest.mark.asyncio
@@ -220,7 +333,11 @@ async def test_eeo_and_consent_stay_untouched_and_are_reported(fixture_server, t
     url = f"{fixture_server}/eeo.html"
     report = await fill_application_form(
         url,
-        ResumeProfile(email="ada@example.test"),
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
         {},
         None,
         "review",
@@ -244,7 +361,11 @@ async def test_sensitive_answers_are_filled_only_after_explicit_user_input(
     url = f"{fixture_server}/eeo.html"
     report = await fill_application_form(
         url,
-        ResumeProfile(email="ada@example.test"),
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
         {
             "gender": "female",
             "privacy_consent": True,
@@ -272,7 +393,11 @@ async def test_cover_letter_is_never_filled_without_explicit_approval(
     url = f"{fixture_server}/cover_letter.html"
     missing_approval = await fill_application_form(
         url,
-        ResumeProfile(),
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
         {},
         None,
         "review",
@@ -286,7 +411,11 @@ async def test_cover_letter_is_never_filled_without_explicit_approval(
     autofill._DOMAIN_RUNS.clear()
     approved = await fill_application_form(
         url,
-        ResumeProfile(),
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
         {},
         None,
         "review",
@@ -296,7 +425,7 @@ async def test_cover_letter_is_never_filled_without_explicit_approval(
         approved_cover_letter="Approved candidate cover letter.",
     )
     assert approved.status == "review_ready"
-    assert approved.filled[0].key == "cover_letter"
+    assert "cover_letter" in {item.key for item in approved.filled}
 
 
 @pytest.mark.asyncio
@@ -336,7 +465,11 @@ async def test_submit_mode_is_downgraded_when_real_apply_is_disabled(
     url = f"{fixture_server}/multistep.html"
     report = await fill_application_form(
         url,
-        ResumeProfile(name="Ada Lovelace", email="ada@example.test"),
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
         {},
         None,
         "submit",
@@ -346,7 +479,7 @@ async def test_submit_mode_is_downgraded_when_real_apply_is_disabled(
         real_apply_enabled=False,
     )
 
-    assert report.status == "dry_run"
+    assert report.status == "dry_run", report.model_dump()
     assert "REAL_APPLY_ENABLED=false" in (report.blocker_reason or "")
 
 
