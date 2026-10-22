@@ -23,6 +23,7 @@ ALLOWED_ANSWER_KEYS = {
     "terms_consent",
     "privacy_consent",
     "legal_attestation",
+    "accept_portal_terms",
 }
 
 

@@ -215,7 +215,7 @@ def install_fake_playwright(
             "greenhouse",
         ),
         (make_job(source_link="https://jobs.lever.co/example/17"), "lever"),
-        (make_job(), "manual"),
+        (make_job(), "autofill"),
     ],
 )
 def test_pick_method(job: Job, expected: str) -> None:
@@ -436,16 +436,17 @@ async def test_form_without_confirmation_fails_honestly(
     assert page.submit_clicked
 
 
-def test_describe_plan_explains_manual_fallback() -> None:
-    assert "can't submit" in describe_plan(make_job())
+def test_describe_plan_describes_one_step_application_and_review_mode() -> None:
+    assert "fill and submit" in describe_plan(make_job())
+    assert "prepare and review" in describe_plan(make_job(), require_review=True)
 
 
 @pytest.mark.asyncio
-async def test_manual_application_returns_needs_manual_and_listing_url() -> None:
+async def test_application_without_resume_returns_failed() -> None:
     job = make_job()
 
     result = await apply(job, ResumeProfile(name="Jordan Lee"), None)
 
-    assert result.method == "manual"
-    assert result.status == "needs_manual"
-    assert str(job.source_link) in result.detail
+    assert result.method == "autofill"
+    assert result.status == "failed"
+    assert "No saved resume file" in result.detail

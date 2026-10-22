@@ -56,7 +56,7 @@ def pick_method(job: Job) -> ApplyMethod:
     return "manual"
 
 
-def describe_plan(job: Job) -> str:
+def describe_plan(job: Job, *, require_review: bool = False) -> str:
     method = pick_method(job)
     if method == "email":
         return f"email your resume to {job.contact_email}"
@@ -66,6 +66,8 @@ def describe_plan(job: Job) -> str:
         return "fill and submit the Lever application form"
     if method == "autofill":
         host = urlsplit(str(job.source_link)).hostname or "employer"
+        if not require_review:
+            return f"fill and submit the application form on the {host} careers portal"
         return (
             f"prepare and review the application form on the {host} careers portal "
             "(nothing will be submitted until you separately approve it)"
@@ -101,6 +103,8 @@ async def apply_by_email(
     job: Job,
     profile: ResumeProfile,
     resume_path: str,
+    *,
+    real_apply_enabled: bool | None = None,
 ) -> ApplyResult:
     try:
         attachment = await asyncio.to_thread(_resume_attachment, resume_path)
@@ -136,7 +140,11 @@ async def apply_by_email(
             subtype=subtype,
             filename=filename,
         )
-        if not _real_apply_enabled():
+        if not (
+            _real_apply_enabled()
+            if real_apply_enabled is None
+            else real_apply_enabled
+        ):
             return ApplyResult(
                 "email",
                 "dry_run",
@@ -238,6 +246,8 @@ async def apply_via_form(
     profile: ResumeProfile,
     resume_path: str,
     ats: Literal["greenhouse", "lever"],
+    *,
+    real_apply_enabled: bool | None = None,
 ) -> ApplyResult:
     browser = None
     playwright = None
@@ -309,7 +319,11 @@ async def apply_via_form(
                             f"Nothing was submitted. Continue manually at {apply_url}.",
                             apply_url,
                         )
-                    elif not _real_apply_enabled():
+                    elif not (
+                        _real_apply_enabled()
+                        if real_apply_enabled is None
+                        else real_apply_enabled
+                    ):
                         result = ApplyResult(
                             ats,
                             "dry_run",
@@ -429,20 +443,28 @@ async def apply(
             "No saved resume file is available. Upload your resume again before applying.",
             str(job.source_link),
         )
+    apply_enabled = (
+        _real_apply_enabled()
+        if real_apply_enabled is None
+        else real_apply_enabled
+    )
     if method == "autofill":
         from server.app.services.autofill import fill_application_form
 
-        apply_enabled = (
-            _real_apply_enabled()
-            if real_apply_enabled is None
-            else real_apply_enabled
+        settings = get_settings()
+        mode = (
+            "review"
+            if settings.require_review and apply_enabled
+            else "submit"
+            if apply_enabled
+            else "dry_run"
         )
         report = await fill_application_form(
             str(job.source_link),
             profile,
             answers or {},
             resume_path,
-            "review" if apply_enabled else "dry_run",
+            mode,
             job,
             session_id=session_id,
             uploads_dir=uploads_dir,
@@ -465,5 +487,9 @@ async def apply(
             report.final_url or str(job.source_link),
         )
     if method == "email":
-        return await apply_by_email(job, profile, resume_path)
-    return await apply_via_form(job, profile, resume_path, method)
+        return await apply_by_email(
+            job, profile, resume_path, real_apply_enabled=apply_enabled
+        )
+    return await apply_via_form(
+        job, profile, resume_path, method, real_apply_enabled=apply_enabled
+    )

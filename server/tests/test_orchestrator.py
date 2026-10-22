@@ -6,6 +6,8 @@ import pytest_asyncio
 from sqlalchemy import select
 
 from server.app.agents.orchestrator import Orchestrator
+from server.app.config import Settings
+from server.app.services.autofill import AutofillReport
 from server.app.models.db import ApplicationRow, create_database, initialize_database
 from server.app.models.schemas import Job, JobRecommendation, ResumeProfile
 from server.app.services.llm import LLMTurn, NativeToolCall
@@ -171,7 +173,9 @@ async def test_orchestrator_supplies_recent_numbered_jobs_to_model(database_sess
 
 
 @pytest.mark.asyncio
-async def test_apply_result_is_returned_without_a_second_model_call(database_session) -> None:
+async def test_apply_result_is_returned_without_a_second_model_call(
+    database_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
     store = SessionStore()
     store.set_profile("anonymous-session-123", ResumeProfile(name="Jordan"))
     model = MockLLM(
@@ -199,15 +203,30 @@ async def test_apply_result_is_returned_without_a_second_model_call(database_ses
             )
         ]
     )
-    orchestrator = Orchestrator(model, store, [make_job()])
+    orchestrator = Orchestrator(
+        model,
+        store,
+        [make_job()],
+        Settings(real_apply_enabled=False, require_review=True),
+    )
+    from server.app.services import autofill
+
+    async def fake_fill_application_form(*args, **kwargs):
+        return AutofillReport(
+            status="needs_manual",
+            blocker_reason="No application form found on the test page.",
+            final_url="https://example.com/backend",
+        )
+
+    monkeypatch.setattr(autofill, "fill_application_form", fake_fill_application_form)
 
     plan = await orchestrator.chat(
         "anonymous-session-123",
         "Apply to job 1",
         database_session,
     )
-    assert plan.reply.startswith("I can open the employer's page")
-    assert plan.reply.endswith("Reply “yes, submit” to continue.")
+    assert plan.reply.startswith("I can prepare and review the application form")
+    assert plan.reply.endswith("Reply “yes, prepare for review” to continue.")
     assert await database_session.scalar(select(ApplicationRow)) is None
 
     result = await orchestrator.chat(
@@ -221,7 +240,7 @@ async def test_apply_result_is_returned_without_a_second_model_call(database_ses
         )
     )
 
-    assert result.reply.startswith("This application was not submitted")
+    assert "No application form found on the test page." in result.reply
     assert len(result.tool_calls) == 1
     assert model.calls == 2
     rows = list(applications)
@@ -230,7 +249,112 @@ async def test_apply_result_is_returned_without_a_second_model_call(database_ses
 
 
 @pytest.mark.asyncio
-async def test_model_cannot_submit_without_a_prior_confirmation(database_session) -> None:
+async def test_one_step_apply_is_called_once_per_explicit_user_message(
+    database_session,
+) -> None:
+    store = SessionStore()
+    store.set_profile("anonymous-session-123", ResumeProfile(name="Jordan"))
+    model = MockLLM(
+        [
+            LLMTurn(
+                text="",
+                tool_calls=[
+                    NativeToolCall(
+                        "apply_to_job",
+                        {"job_id": "displayed:1", "confirm": True},
+                        "apply-call-1",
+                    ),
+                    NativeToolCall(
+                        "apply_to_job",
+                        {"job_id": "displayed:1"},
+                        "apply-call-2",
+                    ),
+                ],
+                model_content="assistant-apply-calls",
+            )
+        ]
+    )
+    calls = 0
+
+    async def fake_apply(context, arguments):
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "dry_run",
+            "message": "Backend Developer at Example Co: Dry run: nothing was sent.",
+            "job_id": "1",
+            "title": "Backend Developer",
+            "company": "Example Co",
+            "apply_url": "https://example.com/backend",
+        }
+
+    store.remember_jobs(
+        "anonymous-session-123",
+        [JobRecommendation(job=make_job(), score=0.8, match_reasons=["Python"])],
+    )
+    orchestrator = Orchestrator(
+        model,
+        store,
+        [make_job()],
+        Settings(real_apply_enabled=False),
+    )
+    definition = orchestrator._tools["apply_to_job"]
+    orchestrator._tools["apply_to_job"] = ToolDefinition(
+        name=definition.name,
+        description=definition.description,
+        input_model=definition.input_model,
+        execute=fake_apply,
+    )
+
+    result = await orchestrator.chat(
+        "anonymous-session-123", "Apply to job 1", database_session
+    )
+
+    assert result.application_result is not None
+    assert result.application_result.status == "dry_run"
+    assert len(result.tool_calls) == 1
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_suggested_apply_is_rejected_without_explicit_user_request(
+    database_session,
+) -> None:
+    store = SessionStore()
+    store.set_profile("anonymous-session-123", ResumeProfile(name="Jordan"))
+    model = MockLLM(
+        [
+            LLMTurn(
+                text="",
+                tool_calls=[
+                    NativeToolCall(
+                        "apply_to_job",
+                        {"job_id": "displayed:1"},
+                        "apply-call",
+                    )
+                ],
+                model_content="assistant-apply-call",
+            )
+        ]
+    )
+    store.remember_jobs(
+        "anonymous-session-123",
+        [JobRecommendation(job=make_job(), score=0.8, match_reasons=["Python"])],
+    )
+    orchestrator = Orchestrator(model, store, [make_job()])
+
+    result = await orchestrator.chat(
+        "anonymous-session-123", "What do you think of job 1?", database_session
+    )
+
+    assert "Which specific job" in result.reply
+    assert result.tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_apply_confirmation_argument_is_ignored_when_review_is_disabled(
+    database_session,
+) -> None:
     store = SessionStore()
     store.set_profile("anonymous-session-123", ResumeProfile(name="Jordan"))
     model = MockLLM(
@@ -248,11 +372,27 @@ async def test_model_cannot_submit_without_a_prior_confirmation(database_session
             )
         ]
     )
-    orchestrator = Orchestrator(model, store, [make_job()])
+    orchestrator = Orchestrator(
+        model, store, [make_job()], Settings(real_apply_enabled=False)
+    )
+    definition = orchestrator._tools["apply_to_job"]
+    received_confirm: list[bool] = []
+
+    async def fake_apply(context, arguments):
+        received_confirm.append(arguments.confirm)
+        return {"status": "dry_run", "message": "Dry run: nothing was sent."}
+
+    orchestrator._tools["apply_to_job"] = ToolDefinition(
+        name=definition.name,
+        description=definition.description,
+        input_model=definition.input_model,
+        execute=fake_apply,
+    )
 
     result = await orchestrator.chat(
         "anonymous-session-123", "Apply to job 1", database_session
     )
 
-    assert "yes, submit" in result.reply
-    assert await database_session.scalar(select(ApplicationRow)) is None
+    assert result.application_result is not None
+    assert result.application_result.status == "dry_run"
+    assert received_confirm == [False]

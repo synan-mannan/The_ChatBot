@@ -41,7 +41,7 @@ from server.app.tools.resume import DEFINITION as PARSE_RESUME_DEFINITION
 MAX_TOOL_ITERATIONS = 5
 
 SYSTEM_PROMPT = """You are AIJob, a concise and supportive job-search assistant.
-Use tools to inspect resumes, find jobs, retrieve job details, record applications, and list applications.
+Use tools to inspect resumes, find jobs, retrieve job details, apply to jobs, and list applications.
 Never invent a job, employer, score, application, or resume fact. You may discuss jobs only when they are
 returned by a tool. When a tool says clarification_required, ask the user its exact clarification question.
 When a tool says resume_required, ask the user to upload a PDF or DOCX resume before continuing.
@@ -52,26 +52,31 @@ For requests to apply to a numbered job, call apply_to_job and use the matching 
 most recent recommendations (for example, job 2 means displayed:2). Use an explicit id:N only when
 the user clearly provides a dataset job ID. Do not ask for clarification when the numbered position
 exists in the recent recommendations.
-For applications, call apply_to_job first with confirm=false. Only call it again with confirm=true
-after the user explicitly agrees in a later message containing a clear affirmative confirmation.
-For generic employer career portals, this confirmation only prepares the form for review. If the
-form is review_ready, it is NOT submitted until the user explicitly says to submit it in a later
-message. “Submit it” resumes the single reviewed application from its stored final application
-URL; if multiple applications are reviewed, ask which one. If the report is needs_input, ask for
-that batch of missing answers; never invent them.
-Report exactly the status, filled field list, missing questions, blockers, and screenshot returned
-by the tool. Never claim submission unless the report status is submitted.
+When the user explicitly asks to apply to a specific job, call apply_to_job exactly once and
+report its actual result. Never apply merely because a job was suggested or discussed; ask which
+job when the reference is ambiguous. Bare numbers refer to the latest displayed results.
+Unless REQUIRE_REVIEW is enabled, applying fills and submits the form in the same action when
+REAL_APPLY_ENABLED=true; when it is false, fill the form but say exactly “Dry run: nothing was sent.”
+When REQUIRE_REVIEW is enabled, keep the confirmation, review, then separate submission flow.
+Only say an application was submitted when a confirmation page/message was detected. For
+needs_input, list all missing questions together in one plain-language message. When the user
+provides answers, call save_application_answers with only those explicit answers and rerun the
+pending application after the tool returns status saved. Never say an answer was saved unless
+save_application_answers returned status saved.
+Report the job title and company, actual status, final application link, filled field labels,
+missing questions, blockers, and screenshot returned by the tool.
 For filters, preserve earlier active filters unless the user asks to remove or replace them.
 When a user provides an application answer such as work authorization, salary, relocation, notice
 period, availability, or EEO information, save only the answer they explicitly stated with
-save_application_answers. Never infer or invent application answers.
+save_application_answers. Never infer or invent application answers. Treat portal terms consent as
+standing consent only after save_application_answers returns status saved.
 Generate cover letters only when asked; show the generated draft and require explicit approval
 before including it in any application.
-An application is submitted only when apply_to_job returns status submitted. For dry_run, say that
-submission is disabled and nothing was sent. For review_ready, say that the form is filled but NOT
-submitted. For needs_input, ask for the listed missing answers in one batch. For needs_manual,
-provide the apply link and say it was not submitted. For failed, explain the failure and offer the
-link. Never claim success for any other status.
+An application is submitted only when apply_to_job returns status submitted. For dry_run, say exactly
+“Dry run: nothing was sent.” When REQUIRE_REVIEW is enabled, review_ready means the form is filled
+but NOT submitted. For needs_input, ask for the listed missing answers in one batch. For needs_manual,
+provide the real application link and say it was not submitted. For failed, explain the failure and
+offer the link. Never claim success for any other status.
 Be transparent about missing information, no matches, and failures. Keep replies brief."""
 
 TOOL_DEFINITIONS = [
@@ -99,6 +104,19 @@ CONFIRMATION_PHRASES = {
     "submit it",
     "submit the application",
 }
+APPLY_TO_NUMBERED_JOB = re.compile(
+    r"\bapply\s+(?:to|for)\s+(?:the\s+)?job\s+(?:number\s+)?#?\d+\b",
+    re.I,
+)
+APPLY_TO_EXPLICIT_ID = re.compile(
+    r"\bapply\s+(?:to|for)\s+(?:job\s+)?(?:id\s*:\s*[\w-]+|job\s+id\s+[\w-]+)\b",
+    re.I,
+)
+TERMS_CONSENT = re.compile(
+    r"\b(?:agree|accept)\b.{0,100}\b(?:terms|conditions|privacy policy|data processing)\b"
+    r"|\b(?:terms|conditions|privacy policy|data processing)\b.{0,100}\b(?:agree|accept)\b",
+    re.I,
+)
 REJECTION_PHRASES = {
     "no",
     "no thanks",
@@ -124,6 +142,19 @@ def _is_submit_instruction(message: str) -> bool:
         "submit the application",
         "submit application",
     }
+
+
+def _is_terms_consent(message: str) -> bool:
+    return not re.search(r"\b(?:don['’]?t|do not|never|cannot|can't)\b", message, re.I) and bool(
+        TERMS_CONSENT.search(message)
+    )
+
+
+def _is_apply_request(message: str) -> bool:
+    return bool(
+        APPLY_TO_NUMBERED_JOB.search(message)
+        or APPLY_TO_EXPLICIT_ID.search(message)
+    )
 
 
 def _is_explicit_rejection(message: str) -> bool:
@@ -184,6 +215,48 @@ class Orchestrator:
             model=self.model,
             settings=self.settings,
         )
+        if _is_terms_consent(message):
+            from server.app.tools.application_answers import (
+                SaveApplicationAnswersInput,
+                save_application_answers_tool,
+            )
+
+            answer_input = SaveApplicationAnswersInput(
+                answers={"accept_portal_terms": True}
+            )
+            saved = await save_application_answers_tool(context, answer_input)
+            if saved.get("status") != "saved":
+                return ChatResponse(
+                    reply="I couldn't save your portal terms consent. Please try again.",
+                    profile=state.profile,
+                )
+            tool_calls = [
+                ToolCall(
+                    name="save_application_answers",
+                    arguments={"answers": {"accept_portal_terms": True}},
+                )
+            ]
+            reply = "Saved your portal terms consent."
+            application_result = None
+            if state.pending_autofill_job_id:
+                rerun = await apply_to_job_tool(
+                    context,
+                    ApplyToJobInput(job_id=f"id:{state.pending_autofill_job_id}"),
+                )
+                tool_calls.append(
+                    ToolCall(
+                        name="apply_to_job",
+                        arguments={"job_id": f"id:{state.pending_autofill_job_id}"},
+                    )
+                )
+                application_result = ApplicationActionResponse.model_validate(rerun)
+                reply = f"{reply} {rerun['message']}"
+            return ChatResponse(
+                reply=reply,
+                tool_calls=tool_calls,
+                application_result=application_result,
+                profile=state.profile,
+            )
         system_instruction = (
             f"{SYSTEM_PROMPT}\n\n"
             "Session state: an uploaded resume profile is "
@@ -211,6 +284,11 @@ class Orchestrator:
                     f"(dataset ID {pending_job.id}). Only proceed if the user's current message "
                     "is an explicit affirmative confirmation."
                 )
+        if self.settings.require_review:
+            system_instruction += (
+                "\nREQUIRE_REVIEW is enabled: use the existing confirmation, review, "
+                "and explicit submit flow."
+            )
         if (
             _is_explicit_rejection(message)
             and (
@@ -253,6 +331,7 @@ class Orchestrator:
         reply = ""
         terminal_tool_result = False
         iterations = 0
+        application_tool_called = False
         while iterations < MAX_TOOL_ITERATIONS:
             turn = await self.model.generate_chat(
                 contents=contents,
@@ -270,6 +349,24 @@ class Orchestrator:
                 definition = self._tools.get(call.name)
                 call_arguments = dict(call.arguments)
                 if call.name == "apply_to_job":
+                    if application_tool_called:
+                        continue
+                    if not _is_apply_request(message) and not (
+                        self.settings.require_review
+                        and state.pending_application_job_id
+                        and _is_explicit_confirmation(message)
+                    ) and not (
+                        self.settings.require_review
+                        and state.pending_submission_job_id
+                        and _is_submit_instruction(message)
+                    ):
+                        reply = (
+                            "Which specific job would you like me to apply to? "
+                            "Use a displayed job number or an explicit job ID."
+                        )
+                        terminal_tool_result = True
+                        break
+                    application_tool_called = True
                     if _is_submit_instruction(message):
                         call_arguments["job_id"] = "pending"
                         call_arguments["confirm"] = False
@@ -350,16 +447,18 @@ class Orchestrator:
                     terminal_tool_result = True
                     break
                 if call.name == "save_application_answers":
-                    reply = str(tool_output.get("message", ""))
-                    if (
-                        tool_output.get("status") == "saved"
-                        and state.pending_autofill_job_id
-                    ):
+                    if tool_output.get("status") != "saved":
+                        reply = (
+                            "I couldn't save those application answers. "
+                            "Please try again."
+                        )
+                    else:
+                        reply = str(tool_output.get("message", ""))
+                    if tool_output.get("status") == "saved" and state.pending_autofill_job_id:
                         rerun = await apply_to_job_tool(
                             context,
                             ApplyToJobInput(
                                 job_id=f"id:{state.pending_autofill_job_id}",
-                                confirm=True,
                             ),
                         )
                         application_result = ApplicationActionResponse.model_validate(

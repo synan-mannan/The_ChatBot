@@ -38,11 +38,17 @@ def reset_rate_limits():
     autofill._REVIEW_RUNS.clear()
 
 
-def _settings(tmp_path: Path, real_apply_enabled: bool) -> Settings:
+def _settings(
+    tmp_path: Path,
+    real_apply_enabled: bool,
+    *,
+    require_review: bool = False,
+) -> Settings:
     return Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'aijob.db'}",
         jobs_file=str(Path("data/jobs.json").resolve()),
         real_apply_enabled=real_apply_enabled,
+        require_review=require_review,
         uploads_dir=str(tmp_path / "uploads"),
         client_dist=str(tmp_path / "client"),
     )
@@ -139,7 +145,10 @@ def test_confirmation_review_preview_and_submit_are_session_scoped(
     monkeypatch.setattr(autofill, "_reserve_run", no_rate_limit)
     session_id = "session-flow-123"
     url = f"{fixture_server}/multistep.html"
-    app = create_app(settings=_settings(tmp_path, True), model=object())
+    app = create_app(
+        settings=_settings(tmp_path, True, require_review=True),
+        model=object(),
+    )
     with TestClient(app) as client:
         _prepare_session(app, session_id, url)
         first = client.post(
@@ -217,13 +226,13 @@ def test_rate_limited_application_can_be_retried(
     app = create_app(settings=_settings(tmp_path, True), model=object())
     with TestClient(app) as client:
         _prepare_session(app, session_id, url)
-        client.post(
-            "/api/applications/apply",
-            json={"session_id": session_id, "job_id": "job-flow"},
-        )
         limited = client.post(
             "/api/applications/apply",
-            json={"session_id": session_id, "job_id": "job-flow", "confirm": True},
+            json={
+                "session_id": session_id,
+                "job_id": "job-flow",
+                "confirm": False,
+            },
         )
         assert limited.json()["status"] == "retry_later"
         assert "rate-limited" in limited.json()["detail"]
@@ -232,8 +241,80 @@ def test_rate_limited_application_can_be_retried(
             "/api/applications/apply",
             json={"session_id": session_id, "job_id": "job-flow"},
         )
-        assert retried.json()["status"] == "review_ready"
+        assert retried.json()["status"] == "submitted"
         assert calls == 2
+
+
+def test_one_step_apply_submits_with_real_apply_enabled(
+    fixture_server, tmp_path, monkeypatch
+) -> None:
+    async def no_rate_limit(
+        domain: str, session_id: str, mode: str, job_id: str = "", **kwargs
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(autofill, "_reserve_run", no_rate_limit)
+    session_id = "session-one-step-123"
+    url = f"{fixture_server}/multistep.html"
+    app = create_app(settings=_settings(tmp_path, True), model=object())
+    with TestClient(app) as client:
+        _prepare_session(app, session_id, url)
+        result = client.post(
+            "/api/applications/apply",
+            json={"session_id": session_id, "job_id": "job-flow"},
+        )
+
+        assert result.status_code == 200
+        assert result.json()["status"] == "submitted"
+        assert "Software Engineer at Example" in result.json()["message"]
+        assert result.json()["screenshot_url"]
+
+
+def test_terms_answer_is_saved_and_application_retries_automatically(
+    fixture_server, tmp_path, monkeypatch
+) -> None:
+    async def no_rate_limit(
+        domain: str, session_id: str, mode: str, job_id: str = "", **kwargs
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(autofill, "_reserve_run", no_rate_limit)
+    session_id = "session-terms-flow"
+    url = f"{fixture_server}/terms.html"
+    app = create_app(settings=_settings(tmp_path, True), model=None)
+    with TestClient(app) as client:
+        _prepare_session(app, session_id, url)
+        app.state.orchestrator.jobs = app.state.jobs
+
+        first = client.post(
+            "/api/applications/apply",
+            json={"session_id": session_id, "job_id": "job-flow"},
+        )
+        assert first.json()["status"] == "needs_input"
+        assert first.json()["needs_input"][0]["label"] == (
+            "I agree to the terms and conditions"
+        )
+
+        consent = client.post(
+            "/api/chat",
+            json={
+                "session_id": session_id,
+                "message": "I agree to the terms and privacy policy",
+            },
+        )
+
+        assert consent.status_code == 200
+        assert consent.json()["application_result"]["status"] == "submitted"
+        assert consent.json()["application_result"]["filled"][-1]["label"] == (
+            "accepted terms (user consented)"
+        )
+        assert [call["name"] for call in consent.json()["tool_calls"]] == [
+            "save_application_answers",
+            "apply_to_job",
+        ]
+        assert app.state.session_store.get(session_id).answers[
+            "accept_portal_terms"
+        ] is True
 
 
 def test_real_apply_disabled_stays_dry_run(fixture_server, tmp_path) -> None:
@@ -245,26 +326,14 @@ def test_real_apply_disabled_stays_dry_run(fixture_server, tmp_path) -> None:
     )
     with TestClient(app) as client:
         _prepare_session(app, session_id, url)
-        app.state.orchestrator.jobs = app.state.jobs
-        client.post(
+        result = client.post(
             "/api/applications/apply",
             json={"session_id": session_id, "job_id": "job-flow"},
         )
-        result = client.post(
-            "/api/applications/apply",
-            json={"session_id": session_id, "job_id": "job-flow", "confirm": True},
-        )
         assert result.status_code == 200
         assert result.json()["status"] == "dry_run"
-        assert "nothing was submitted" in result.json()["detail"].casefold()
-        submit_attempt = client.post(
-            "/api/chat",
-            json={"session_id": session_id, "message": "submit it"},
-        )
-        assert (
-            submit_attempt.json()["application_result"]["status"]
-            == "dry_run"
-        )
+        assert result.json()["detail"] == "Dry run: nothing was sent."
+        assert "Dry run: nothing was sent." in result.json()["message"]
 
 
 def test_chat_saves_answers_and_reruns_needs_input(fixture_server, tmp_path, monkeypatch) -> None:
@@ -298,7 +367,7 @@ def test_chat_saves_answers_and_reruns_needs_input(fixture_server, tmp_path, mon
             json={"session_id": session_id, "message": "My notice period is 30 days."},
         )
         assert response.status_code == 200
-        assert response.json()["application_result"]["status"] == "review_ready"
+        assert response.json()["application_result"]["status"] == "needs_manual"
         assert "notice_period" in {
             field["key"]
             for field in response.json()["application_result"]["filled"]
@@ -322,7 +391,7 @@ def test_submit_it_reopens_stored_final_url(fixture_server, tmp_path, monkeypatc
     session_id = "session-submit-it"
     listing_url = f"{fixture_server}/aggregator.html"
     app = create_app(
-        settings=_settings(tmp_path, True),
+        settings=_settings(tmp_path, True, require_review=True),
         model=SubmitApplicationModel(),
     )
     with TestClient(app) as client:
@@ -383,7 +452,10 @@ def test_retry_later_preserves_review_state_preview_and_answer_snapshot(
     monkeypatch.setattr(autofill, "fill_application_form", fill)
     session_id = "session-retry-state"
     url = f"{fixture_server}/aggregator.html"
-    app = create_app(settings=_settings(tmp_path, True), model=object())
+    app = create_app(
+        settings=_settings(tmp_path, True, require_review=True),
+        model=object(),
+    )
     with TestClient(app) as client:
         _prepare_session(app, session_id, url)
         app.state.session_store.get(session_id).answers = {"notice_period": "30 days"}

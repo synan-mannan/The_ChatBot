@@ -90,7 +90,12 @@ async def _claim_retryable_application(
     context: ToolContext,
     row: ApplicationRow,
     job: Job,
-    allowed_statuses: tuple[str, ...] = ("failed", "needs_input", "review_ready"),
+    allowed_statuses: tuple[str, ...] = (
+        "failed",
+        "needs_input",
+        "needs_manual",
+        "review_ready",
+    ),
 ) -> bool:
     result = await context.db_session.execute(
         update(ApplicationRow)
@@ -101,7 +106,7 @@ async def _claim_retryable_application(
         .values(
             status="in_progress",
             method=pick_method(job),
-            detail="Preparing the application after explicit confirmation.",
+            detail="Applying to the selected job.",
             apply_url=str(job.source_link),
         )
     )
@@ -122,12 +127,14 @@ def _autofill_output(
     if status == "review_ready":
         detail = "The application form is filled and ready for review. It has NOT been submitted."
     elif status == "dry_run":
-        detail = (
-            "Dry run only: the application form was prepared, but nothing was submitted "
-            "because REAL_APPLY_ENABLED=false."
-        )
+        detail = "Dry run: nothing was sent."
     elif status == "needs_input":
-        detail = "The form is not ready to submit; please answer the listed questions."
+        questions = ", ".join(item.label for item in report.needs_input)
+        detail = (
+            f"The form needs your input: {questions}."
+            if questions
+            else "The form needs your input before it can be submitted."
+        )
     elif status == "needs_manual":
         detail = report.blocker_reason or "Continue this application manually."
     elif status == "submitted":
@@ -138,6 +145,9 @@ def _autofill_output(
         detail = report.blocker_reason or "The form could not be completed; please verify manually."
     existing_report = application.report_data or {}
     apply_url = report.final_url or application.apply_url or str(job.source_link)
+    message = f"{job.title} at {job.company}: {detail}"
+    if status in {"needs_input", "needs_manual", "failed", "retry_later"}:
+        message += f" Application page: {apply_url}"
     if persist:
         report_data = report.model_dump(mode="json")
         report_data["answers_snapshot"] = (
@@ -157,7 +167,7 @@ def _autofill_output(
         "status": status,
         "method": "autofill",
         "detail": detail,
-        "message": detail,
+        "message": message,
         "apply_url": apply_url,
         "job_id": job.id,
         "title": job.title,
@@ -276,7 +286,8 @@ async def apply_to_job_tool(
             "message": "Ask the user to upload a resume before applying.",
         }
     requested_job_id = arguments.job_id
-    if arguments.submit and requested_job_id == "pending":
+    require_review = context.settings.require_review
+    if require_review and arguments.submit and requested_job_id == "pending":
         statuses = (
             ("review_ready",)
             if context.settings.real_apply_enabled
@@ -325,7 +336,7 @@ async def apply_to_job_tool(
     method = pick_method(job)
     previous_state = None
 
-    if arguments.submit:
+    if require_review and arguments.submit:
         if method != "autofill":
             return {
                 "status": "needs_manual",
@@ -399,19 +410,19 @@ async def apply_to_job_tool(
             context.state.pending_submission_job_id = None
         return output
 
-    auto_rerun = (
-        existing is None
-        and context.state.pending_application_job_id == job.id
-    ) or (
-        existing is not None
-        and existing.status in {"needs_input", "failed"}
-        and context.state.pending_autofill_job_id == job.id
-    )
-    retryable_statuses = {"failed", "needs_input"}
-    if existing is not None and existing.status not in retryable_statuses and not auto_rerun:
+    retryable_statuses = {
+        "failed",
+        "needs_input",
+        "needs_manual",
+        "review_ready",
+    }
+    if existing is not None and existing.status in {"submitted", "dry_run"}:
+        return _duplicate_result(existing, job)
+    if existing is not None and existing.status not in retryable_statuses:
         return _duplicate_result(existing, job)
 
-    if not auto_rerun and (
+    auto_rerun = existing is not None and existing.status in retryable_statuses
+    if require_review and not auto_rerun and (
         not arguments.confirm or context.state.pending_application_job_id != job.id
     ):
         context.state.pending_application_job_id = job.id
@@ -420,9 +431,10 @@ async def apply_to_job_tool(
             "job_id": job.id,
             "title": job.title,
             "company": job.company,
-            "plan": describe_plan(job),
+            "plan": describe_plan(job, require_review=True),
             "message": (
-                f"I can {describe_plan(job)} for {job.title} at {job.company}. "
+                f"I can {describe_plan(job, require_review=True)} "
+                f"for {job.title} at {job.company}. "
                 + (
                     "Nothing will be submitted yet. Reply “yes, prepare for review” to continue."
                     if method == "autofill"
@@ -437,7 +449,7 @@ async def apply_to_job_tool(
             job_id=job.id,
             status="in_progress",
             method=method,
-            detail="Preparing the application after explicit confirmation.",
+            detail="Applying to the selected job.",
             apply_url=str(job.source_link),
         )
         context.db_session.add(application)
@@ -471,7 +483,13 @@ async def apply_to_job_tool(
         application = existing
 
     if method == "autofill":
-        mode = "review" if context.settings.real_apply_enabled else "dry_run"
+        mode = (
+            "review"
+            if require_review and context.settings.real_apply_enabled
+            else "submit"
+            if context.settings.real_apply_enabled
+            else "dry_run"
+        )
         output = await _run_generic_autofill(
             context,
             job,
@@ -484,7 +502,16 @@ async def apply_to_job_tool(
             context.state.pending_application_job_id = None
         return output
 
-    result = await apply(job, context.state.profile, context.state.resume_path)
+    result = await apply(
+        job,
+        context.state.profile,
+        context.state.resume_path,
+        answers=context.state.answers,
+        session_id=context.session_id,
+        uploads_dir=context.settings.uploads_dir,
+        model=context.model,
+        real_apply_enabled=context.settings.real_apply_enabled,
+    )
     application.status = result.status
     application.method = result.method
     application.detail = result.detail
@@ -495,7 +522,7 @@ async def apply_to_job_tool(
         "status": result.status,
         "method": result.method,
         "detail": result.detail,
-        "message": result.detail,
+        "message": f"{job.title} at {job.company}: {result.detail}",
         "apply_url": result.apply_url,
         "job_id": job.id,
         "title": job.title,
@@ -553,11 +580,8 @@ async def list_applications_tool(
 APPLY_DEFINITION = ToolDefinition(
     name="apply_to_job",
     description=(
-        "Prepare an application for a valid job in this dataset. First call with confirm=false "
-        "to show the plan; only call again with confirm=true after the user explicitly agrees "
-        "in a later message. For generic career portals, confirm prepares a review; use submit=true "
-        "only after a separate explicit user instruction to submit a reviewed form. Never submit "
-        "without that confirmation. Bare numbers refer to the latest displayed result; use id:N "
+        "Apply to a valid job in this dataset when the user explicitly requests it. "
+        "Bare numbers refer to the latest displayed result; use id:N "
         "only for an explicit dataset ID. One application is processed at a time."
     ),
     input_model=ApplyToJobInput,

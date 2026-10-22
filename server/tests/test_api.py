@@ -12,6 +12,8 @@ from fastapi.testclient import TestClient
 from server.app.config import Settings
 from server.app.main import create_app
 from server.app.models.schemas import ResumeProfile
+from server.app.services import autofill
+from server.app.services.autofill import AutofillReport
 from server.app.services.llm import LLMTurn, NativeToolCall
 from server.app.tools.base import ToolDefinition
 
@@ -74,17 +76,21 @@ def make_docx() -> bytes:
     return buffer.getvalue()
 
 
-def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
+def test_upload_recommend_apply_and_list_flow(tmp_path: Path, monkeypatch) -> None:
     session_id = "anonymous-browser-session-123"
     model = ScriptedModel(
         [
             tool_turn("recommend_jobs", {"filters": {}, "top_k": 2}),
-            tool_turn("apply_to_job", {"job_id": "displayed:2", "confirm": False}),
-            tool_turn("apply_to_job", {"job_id": "displayed:2", "confirm": True}),
+            tool_turn("apply_to_job", {"job_id": "displayed:2"}),
             tool_turn("list_applications", {}),
-            tool_turn("apply_to_job", {"job_id": "displayed:2", "confirm": False}),
+            tool_turn("apply_to_job", {"job_id": "displayed:2"}),
         ]
     )
+
+    async def fake_fill_application_form(url, *args, **kwargs):
+        return AutofillReport(status="dry_run", final_url=url)
+
+    monkeypatch.setattr(autofill, "fill_application_form", fake_fill_application_form)
     settings = Settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'aijob.db'}",
         jobs_file=str(ROOT / "data" / "jobs.json"),
@@ -131,22 +137,9 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
             json={"session_id": session_id, "message": "Apply to job 2"},
         )
         assert applied.status_code == 200
-        assert applied.json()["reply"].startswith("I can open the employer's page")
-        assert applied.json()["application_confirmation"]["job_id"] == second_job_id
-        assert "yes, submit" in applied.json()["reply"]
+        assert applied.json()["application_result"]["status"] == "dry_run"
+        assert "Dry run: nothing was sent." in applied.json()["reply"]
         assert "2. " in model.system_instructions[1]
-        assert client.get(
-            "/api/applications", params={"session_id": session_id}
-        ).json()["applications"] == []
-
-        submitted = client.post(
-            "/api/chat",
-            json={"session_id": session_id, "message": "yes, submit"},
-        )
-        assert submitted.status_code == 200
-        assert "not submitted" in submitted.json()["reply"].lower()
-        assert submitted.json()["application_result"]["status"] == "needs_manual"
-        assert recommended.json()["jobs"][1]["job"]["source_link"] in submitted.json()["reply"]
 
         listed = client.post(
             "/api/chat",
@@ -171,7 +164,9 @@ def test_upload_recommend_apply_and_list_flow(tmp_path: Path) -> None:
         assert client.get("/api/health").json()["jobs_loaded"] == 1800
 
 
-def test_application_card_endpoint_does_not_call_llm(tmp_path: Path) -> None:
+def test_application_card_endpoint_does_not_call_llm(
+    tmp_path: Path, monkeypatch
+) -> None:
     session_id = "anonymous-browser-session-apply"
     model = ScriptedModel([])
     settings = Settings(
@@ -182,10 +177,12 @@ def test_application_card_endpoint_does_not_call_llm(tmp_path: Path) -> None:
     )
 
     app = create_app(settings, model)
-    with TestClient(app) as client:
-        from server.app.services.applicant import pick_method
+    async def fake_fill_application_form(url, *args, **kwargs):
+        return AutofillReport(status="dry_run", final_url=url)
 
-        job_id = next(job.id for job in app.state.jobs if pick_method(job) == "manual")
+    monkeypatch.setattr(autofill, "fill_application_form", fake_fill_application_form)
+    with TestClient(app) as client:
+        job_id = "1"
         first = client.post(
             "/api/applications/apply",
             json={"session_id": session_id, "job_id": job_id},
@@ -212,17 +209,17 @@ def test_application_card_endpoint_does_not_call_llm(tmp_path: Path) -> None:
         )
         second = client.post(
             "/api/applications/apply",
-            json={"session_id": session_id, "job_id": job_id, "confirm": True},
+            json={"session_id": session_id, "job_id": job_id},
         )
         duplicate = client.post(
             "/api/applications/apply",
-            json={"session_id": session_id, "job_id": job_id, "confirm": True},
+            json={"session_id": session_id, "job_id": job_id},
         )
 
         assert first.status_code == 200
-        assert first.json()["status"] == "confirmation_required"
+        assert first.json()["status"] == "dry_run"
         assert second.status_code == 200
-        assert second.json()["status"] == "needs_manual"
+        assert second.json()["status"] == "duplicate"
         assert duplicate.status_code == 200
         assert duplicate.json()["status"] == "duplicate"
     assert model.turns == deque()

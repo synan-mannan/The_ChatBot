@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
     real_apply_enabled: bool = False
+    require_review: bool = False
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_user: str = ""
