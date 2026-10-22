@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<body>
+  <form id="application">
+    <label>Full name <input name="name" required></label>
+    <label>Email address <input type="email" name="email" required></label>
+    <label>Phone number <input type="tel" name="phone" required></label>
+    <label>I agree to the terms and conditions
+      <input type="checkbox" name="terms" required>
+    </label>
+    <label>Subscribe to marketing emails
+      <input type="checkbox" name="marketing" checked>
+    </label>
+    <button type="submit">Submit application</button>
+  </form>
+  <p id="confirmation" hidden>Application submitted successfully.</p>
+  <script>
+    document.querySelector("#application").addEventListener("submit", (event) => {
+      event.preventDefault();
+      event.currentTarget.hidden = true;
+      document.querySelector("#confirmation").hidden = false;
+    });
+  </script>
+</body>
+</html>

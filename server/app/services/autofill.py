@@ -61,6 +61,7 @@ ALLOWED_ANSWER_KEYS = {
     "terms_consent",
     "privacy_consent",
     "legal_attestation",
+    "accept_portal_terms",
 }
 ALLOWED_MAPPING_KEYS = ALLOWED_PROFILE_KEYS | ALLOWED_ANSWER_KEYS
 FORM_TIMEOUT_SECONDS = 30
@@ -132,6 +133,7 @@ class FormField:
     metadata: str = ""
     form_key: str = "page"
     form_metadata: str = ""
+    form_text: str = ""
     visible: bool = True
 
 
@@ -218,6 +220,13 @@ def _deterministic_key(field: FormField) -> str | None:
     ):
         return "resume_path"
     label = _normalize(" ".join((field.label, field.name, field.field_id, field.metadata)))
+    if field.field_type == "checkbox" and re.search(
+        r"\b(?:terms and conditions|terms of (?:service|use|the portal)|"
+        r"privacy policy|data processing|i agree.{0,60}terms)\b",
+        label,
+        re.I,
+    ):
+        return "privacy_consent" if re.search(r"\bprivacy\b", label, re.I) else "terms_consent"
     rules: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("resume_path", (r"\b(resume|cv|curriculum vitae)\b",)),
         ("cover_letter", (r"\bcover letter\b",)),
@@ -257,6 +266,27 @@ def _deterministic_key(field: FormField) -> str | None:
         if any(re.search(pattern, label) for pattern in patterns):
             return key
     return None
+
+
+def _is_marketing_checkbox(field: FormField) -> bool:
+    return field.field_type == "checkbox" and bool(
+        re.search(
+            r"\b(?:marketing|newsletter|job alerts?|product updates|"
+            r"promotional emails|email updates|subscribe)\b",
+            _normalize(
+                " ".join(
+                    (
+                        field.label,
+                        field.name,
+                        field.field_id,
+                        field.metadata,
+                        field.form_metadata,
+                    )
+                )
+            ),
+            re.I,
+        )
+    )
 
 
 def _detected_ats(url: str) -> Literal[
@@ -310,14 +340,24 @@ _PROFILE_FORM_KEYS = ALLOWED_PROFILE_KEYS - {
 def is_application_form(fields: list[FormField]) -> bool:
     if not fields or not any(field.visible for field in fields):
         return False
+    form_text = next((field.form_text for field in fields if field.form_text), "")
+    for field_info in fields:
+        if _is_marketing_checkbox(field_info):
+            form_text = re.sub(
+                re.escape(field_info.label),
+                "",
+                form_text,
+                flags=re.I,
+            )
     description = " ".join(
         " ".join(
             (
                 field.form_metadata,
-                field.label,
-                field.name,
-                field.field_id,
-                field.metadata,
+                form_text,
+                "" if _is_marketing_checkbox(field) else field.label,
+                "" if _is_marketing_checkbox(field) else field.name,
+                "" if _is_marketing_checkbox(field) else field.field_id,
+                "" if _is_marketing_checkbox(field) else field.metadata,
             )
         )
         for field in fields
@@ -547,9 +587,9 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
                     formKey: element.closest('form')
                       ? `form-${Array.from(document.forms).indexOf(element.closest('form'))}`
                       : 'page',
+                    formText: element.closest('form') ? text(element.closest('form')) : '',
                     formMetadata: element.closest('form')
                       ? [
-                          text(element.closest('form')),
                           element.closest('form').id,
                           element.closest('form').className,
                           element.closest('form').getAttribute('action') || '',
@@ -595,6 +635,7 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
                     ),
                     form_key=str(info["formKey"]),
                     form_metadata=str(info["formMetadata"]),
+                    form_text=str(info["formText"]),
                     visible=bool(info["visible"]),
                 )
             )
@@ -620,6 +661,7 @@ async def _discover_fields(frames: list[Any]) -> list[FormField]:
                     metadata=" ".join(label for label, _ in options),
                     form_key=str(first["formKey"]),
                     form_metadata=str(first["formMetadata"]),
+                    form_text=str(first["formText"]),
                     visible=any(
                         bool(item["visible"]) for _, item in group_items
                     ),
@@ -725,8 +767,15 @@ async def _resolve_application_entry(
     page: Any,
 ) -> tuple[Any, list[FormField], list[FormField], str | None]:
     for hop in range(5):
-        if hop == 0 and _is_aggregator(urlsplit(page.url).hostname or ""):
+        is_aggregator_listing = (
+            hop == 0 and _is_aggregator(urlsplit(page.url).hostname or "")
+        )
+        if is_aggregator_listing:
             logger.info("autofill aggregator listing detected: host=%s", urlsplit(page.url).hostname)
+            destination = await _activate_apply_control(page, list(page.frames))
+            if destination is not None:
+                page = destination
+                continue
         frames = list(page.frames)
         fields, discovered = await _application_form_fields(frames)
         reason = await _blocker_reason(frames, page.url)
@@ -784,6 +833,46 @@ async def _fill_fields(
         key = mapping.get(field_info.label) or _deterministic_key(field_info)
         sensitive = _sensitive_question(field_info)
         if field_info.field_type == "checkbox":
+            if key in {"accept_portal_terms", "terms_consent", "privacy_consent"}:
+                answer = answers.get(key)
+                if answers.get("accept_portal_terms") is True or answer is True:
+                    await field_info.controls[0].check(timeout=ACTION_TIMEOUT_MS)
+                    filled.append(
+                        FilledField(
+                            label="accepted terms (user consented)",
+                            key=(
+                                "accept_portal_terms"
+                                if answers.get("accept_portal_terms") is True
+                                else key
+                            ),
+                        )
+                    )
+                elif answer is not None:
+                    checked = _checkbox_answer(field_info, str(answer))
+                    if checked is None:
+                        needs_input.append(_needs_input(field_info))
+                    elif checked:
+                        await field_info.controls[0].check(timeout=ACTION_TIMEOUT_MS)
+                        filled.append(FilledField(label=field_info.label, key=key))
+                    else:
+                        await field_info.controls[0].uncheck(
+                            timeout=ACTION_TIMEOUT_MS
+                        )
+                else:
+                    if await field_info.controls[0].is_checked():
+                        await field_info.controls[0].uncheck(
+                            timeout=ACTION_TIMEOUT_MS
+                        )
+                    needs_input.append(_needs_input(field_info))
+                continue
+            if _is_marketing_checkbox(field_info):
+                if await field_info.controls[0].is_checked():
+                    await field_info.controls[0].uncheck(
+                        timeout=ACTION_TIMEOUT_MS
+                    )
+                if field_info.required:
+                    needs_input.append(_needs_input(field_info))
+                continue
             if key and key in answers:
                 answer = answers[key]
                 if answer is True:
@@ -811,6 +900,10 @@ async def _fill_fields(
                 else:
                     needs_input.append(_needs_input(field_info))
             else:
+                needs_input.append(_needs_input(field_info))
+            continue
+        if key == "accept_portal_terms":
+            if field_info.required:
                 needs_input.append(_needs_input(field_info))
             continue
         if key == "cover_letter" and not approved_cover_letter:
@@ -1117,6 +1210,24 @@ def _mark_review_run(session_id: str, job_id: str, domains: set[str]) -> None:
         _REVIEW_RUNS[(session_id, job_id, domain)] = now
 
 
+async def _reserve_submission(session_id: str) -> str | None:
+    now = datetime.now(timezone.utc)
+    async with _RATE_LIMIT_LOCK:
+        recent = [
+            value
+            for value in _SESSION_SUBMISSIONS.get(session_id, [])
+            if now - value < SESSION_HOUR
+        ]
+        if len(recent) >= 5:
+            return (
+                "The maximum of five real application submissions per session "
+                "per hour was reached."
+            )
+        recent.append(now)
+        _SESSION_SUBMISSIONS[session_id] = recent
+    return None
+
+
 async def fill_application_form(
     url: str,
     profile: ResumeProfile,
@@ -1182,6 +1293,7 @@ async def fill_application_form(
         session_id,
         mode,
         job.id,
+        count_submission=False,
         review_submit_exemption=review_submit_exemption,
     )
     if rate_reason:
@@ -1313,6 +1425,11 @@ async def fill_application_form(
                 report.status = "review_ready"
                 return report
 
+            submission_limit_reason = await _reserve_submission(session_id)
+            if submission_limit_reason:
+                report.status = "retry_later"
+                report.blocker_reason = submission_limit_reason
+                return report
             submit = await _submit_button(fields)
             if submit is None:
                 report.status = "needs_manual"

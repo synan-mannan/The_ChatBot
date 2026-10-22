@@ -221,6 +221,87 @@ async def test_fewer_than_three_profile_fields_never_become_review_ready(
 
 
 @pytest.mark.asyncio
+async def test_terms_checkbox_needs_explicit_consent(fixture_server, tmp_path) -> None:
+    url = f"{fixture_server}/terms.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
+        {},
+        None,
+        "review",
+        _job(url, "terms-no-consent"),
+        session_id="session-terms-no",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "needs_input"
+    assert [field.label for field in report.needs_input] == [
+        "I agree to the terms and conditions"
+    ]
+    assert all(
+        field.label != "accepted terms (user consented)"
+        for field in report.filled
+    )
+
+
+@pytest.mark.asyncio
+async def test_terms_checkbox_is_checked_only_with_saved_consent(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/terms.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
+        {"accept_portal_terms": True},
+        None,
+        "review",
+        _job(url, "terms-consent"),
+        session_id="session-terms-yes",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "review_ready"
+    assert any(
+        field.label == "accepted terms (user consented)"
+        and field.key == "accept_portal_terms"
+        for field in report.filled
+    )
+
+
+@pytest.mark.asyncio
+async def test_eeo_questions_need_input_and_marketing_is_not_accepted(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/eeo_marketing.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
+        {},
+        None,
+        "review",
+        _job(url, "eeo-marketing"),
+        session_id="session-eeo-marketing",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "needs_input"
+    assert any(field.label == "Gender" for field in report.needs_input)
+    assert all("newsletter" not in field.label.casefold() for field in report.filled)
+
+
+@pytest.mark.asyncio
 async def test_select_and_radio_answers_match_options(fixture_server, tmp_path) -> None:
     url = f"{fixture_server}/select_radio.html"
     report = await fill_application_form(
