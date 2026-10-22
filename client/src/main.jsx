@@ -27,7 +27,7 @@ const APPLICATION_STATUS_LABELS = {
   submitted: "Submitted",
   dry_run: "Dry run",
   review_ready: "Ready for review — not submitted",
-  needs_input: "Answers needed",
+  needs_input: "Needs your input",
   needs_manual: "Needs manual action",
   failed: "Failed",
   retry_later: "Retry later",
@@ -196,12 +196,13 @@ function ApplicationStatus({ status }) {
   );
 }
 
-function ApplicationOutcome({ result, onSubmit, onCancel }) {
-  const status = result.status === "review_ready" && (result.filled?.length || 0) < 3
-    ? "needs_manual"
+function ApplicationOutcome({ result }) {
+  const reportedStatus = result.status === "duplicate"
+    ? result.application_status
     : result.status;
-  const canSubmit = ["review_ready", "dry_run"].includes(status);
-  const canCancel = ["review_ready", "dry_run", "needs_input"].includes(status);
+  const status = reportedStatus === "review_ready" && (result.filled?.length || 0) < 3
+    ? "needs_manual"
+    : reportedStatus;
   return (
     <section className="application-outcome" aria-label="Application result">
       <div className="application-outcome-heading">
@@ -261,46 +262,11 @@ function ApplicationOutcome({ result, onSubmit, onCancel }) {
           </ul>
         </div>
       )}
-      {(canSubmit || canCancel) && (
-        <div className="job-actions">
-          {canSubmit && (
-            <button
-              className="button button-small"
-              onClick={() => onSubmit(result.job_id)}
-              disabled={result.status === "dry_run"}
-              title={result.status === "dry_run" ? "Submission is disabled by server configuration." : ""}
-            >
-              Submit
-            </button>
-          )}
-          <button className="button button-small button-secondary" onClick={onCancel}>
-            Cancel
-          </button>
-        </div>
-      )}
     </section>
   );
 }
 
-function ApplicationConfirmation({ confirmation, onConfirm, onCancel }) {
-  return (
-    <section className="application-confirmation" aria-label="Confirm application">
-      <p><strong>{confirmation.title}</strong> · {confirmation.company}</p>
-      <p>Plan: {confirmation.plan}.</p>
-      <p>Nothing will be sent until you confirm.</p>
-      <div className="job-actions">
-        <button className="button button-small" onClick={() => onConfirm(confirmation.job_id)}>
-          {confirmation.plan?.includes("prepare and review") ? "Prepare for review" : "Yes, submit"}
-        </button>
-        <button className="button button-small button-secondary" onClick={onCancel}>
-          Cancel
-        </button>
-      </div>
-    </section>
-  );
-}
-
-function ToolChips({ tools, result, confirmation }) {
+function ToolChips({ tools, result }) {
   if (!tools?.length) return null;
   return (
     <div className="tool-chips" aria-label="Tools used">
@@ -308,11 +274,9 @@ function ToolChips({ tools, result, confirmation }) {
         <span className="tool-chip" key={`${tool.name}-${index}`}>
           <span className="tool-sparkle">✦</span> Used: {
             tool.name === "apply_to_job"
-              ? confirmation
-                ? "Application plan"
-                : ["review_ready", "dry_run"].includes(result?.status)
-                  ? "Application form prepared"
-                  : "Application status"
+              ? result?.status === "in_progress"
+                ? "Applying"
+                : "Application status"
               : TOOL_LABELS[tool.name] || tool.name
           }
         </span>
@@ -321,7 +285,7 @@ function ToolChips({ tools, result, confirmation }) {
   );
 }
 
-function Message({ message, onApply, onConfirm, onSubmit, onCancel }) {
+function Message({ message, onApply }) {
   const isUser = message.role === "user";
   return (
     <div className={`message-row ${isUser ? "message-user" : "message-assistant"}`}>
@@ -336,24 +300,14 @@ function Message({ message, onApply, onConfirm, onSubmit, onCancel }) {
           <ToolChips
             tools={message.toolCalls}
             result={message.applicationResult}
-            confirmation={message.applicationConfirmation}
           />
         )}
         {!isUser && message.profile && <ProfileCard profile={message.profile} />}
         {!isUser && <JobCards jobs={message.jobs} onApply={onApply} />}
         {!isUser && message.applications && <ApplicationList applications={message.applications} />}
-        {!isUser && message.applicationConfirmation && (
-          <ApplicationConfirmation
-            confirmation={message.applicationConfirmation}
-            onConfirm={onConfirm}
-            onCancel={onCancel}
-          />
-        )}
         {!isUser && message.applicationResult && (
           <ApplicationOutcome
             result={message.applicationResult}
-            onSubmit={onSubmit}
-            onCancel={onCancel}
           />
         )}
       </div>
@@ -457,7 +411,7 @@ function App() {
     }
   }
 
-  async function applyToJob(jobId, confirm = false, submit = false) {
+  async function applyToJob(jobId) {
     if (busy) return;
     setError("");
     setBusy(true);
@@ -465,7 +419,7 @@ function App() {
       const response = await fetch("/api/applications/apply", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: SESSION_ID, job_id: jobId, confirm, submit })
+        body: JSON.stringify({ session_id: SESSION_ID, job_id: jobId })
       });
       const payload = await responseJson(response);
       setMessages((current) => [...current, {
@@ -556,9 +510,6 @@ function App() {
               key={message.id}
               message={message}
               onApply={applyToJob}
-              onConfirm={(jobId) => applyToJob(jobId, true)}
-              onSubmit={(jobId) => applyToJob(jobId, false, true)}
-              onCancel={() => sendMessage("cancel")}
             />
           ))}
           {busy && (

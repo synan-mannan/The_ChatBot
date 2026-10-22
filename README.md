@@ -83,7 +83,7 @@ python -m pytest -q tests
 ## LLM and job sources
 
 - **LLM:** Groq via the official `groq` Python SDK and native function calling, or Gemini via the official `google-genai` SDK. When both keys are configured, Groq is selected. Set `GROQ_API_KEY`; `GROQ_MODEL` defaults to `llama-3.3-70b-versatile`. Gemini remains available with `GEMINI_API_KEY` and `GEMINI_MODEL` (default `gemini-2.5-flash`). Transient timeout/rate-limit/server failures receive bounded exponential retries.
-- **Job feeds:** Arbeitnow, Remotive, Jobicy, Himalayas, and RemoteOK API adapters are implemented in `scripts/scrape.py`. The committed snapshot currently includes Arbeitnow and Jobicy records. Application buttons use the listing's source URL; see [Applying to jobs](#applying-to-jobs) for the confirmation and submission behavior.
+- **Job feeds:** Arbeitnow, Remotive, Jobicy, Himalayas, and RemoteOK API adapters are implemented in `scripts/scrape.py`. The committed snapshot currently includes Arbeitnow and Jobicy records. Application buttons resolve the employer's final application URL; see [Applying to jobs](#applying-to-jobs) for the one-step behavior.
 - **Resume readers:** `pypdf` for text-based PDFs and `python-docx` for DOCX. OCR/scanned PDFs are not supported.
 - **Matching:** scikit-learn TF-IDF title similarity; skill synonyms and the remaining scoring/filter logic are deterministic Python.
 
@@ -100,7 +100,8 @@ python -m pytest -q tests
 | `CLIENT_DIST` | `client/dist` | Built React assets served by FastAPI |
 | `MAX_RESUME_BYTES` | `5242880` | Upload size limit |
 | `LLM_MAX_RETRIES` | `3` | Bounded retries for transient provider errors (1–8) |
-| `REAL_APPLY_ENABLED` | `false` | Enable the final send/submit action after a user confirms |
+| `REAL_APPLY_ENABLED` | `false` | Enable real email delivery and application submission |
+| `REQUIRE_REVIEW` | `false` | Restore the confirmation, review, and separate-submit flow |
 | `SMTP_HOST` | empty | STARTTLS SMTP server for email applications |
 | `SMTP_PORT` | `587` | SMTP server port |
 | `SMTP_USER` | empty | Optional SMTP username |
@@ -109,13 +110,13 @@ python -m pytest -q tests
 
 ## Applying to jobs
 
-Application actions retain server-side confirmation. AIJob first shows the job and the application plan. For email and the existing Greenhouse/Lever fast paths, the user confirms before the original send/submit flow proceeds. Generic employer portals use a separate review-then-submit flow described below. `REAL_APPLY_ENABLED=false` is the default and prevents all real submissions.
+By default, an explicit “apply to job N” request fills and submits the application in one action when `REAL_APPLY_ENABLED=true`. When real applications are disabled, AIJob fills the form, saves a preview, and responds: “Dry run: nothing was sent.” Set `REQUIRE_REVIEW=true` to opt into the legacy confirmation, review, and separate-submit sequence. `REAL_APPLY_ENABLED=false` prevents real submissions.
 
 Supported paths:
 
 - **Email:** Listings with a provided contact email get a prepared message with the candidate's contact information and PDF/DOCX resume attached. Real delivery uses STARTTLS and `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, and `SMTP_FROM`.
-- **Greenhouse and Lever:** The assistant opens the listing form, fills standard candidate fields when available, and attaches the resume. Lever links are opened at the `/apply` path. On explicit confirmation with real mode enabled, the assistant submits and only reports success if the page displays a receipt/confirmation message.
-- **Employer career portals:** Other HTTP(S) links are handled by the generic auto-fill engine. Aggregator listings are followed through up to four Apply links, tabs, and redirects to the employer application page. Newsletter, job-alert, search, login, cookie, and comment forms are never filled. The form is filled from the saved resume profile and explicitly supplied application answers, then shown for review; submission requires another explicit user action.
+- **Greenhouse and Lever:** The assistant opens the listing form, fills standard candidate fields when available, and attaches the resume. Lever links are opened at the `/apply` path. With real mode enabled, the assistant submits and only reports success if the page displays a receipt/confirmation message.
+- **Employer career portals:** Other HTTP(S) links are handled by the generic auto-fill engine. Aggregator listings are followed through up to four Apply links, tabs, and redirects to the employer application page. Newsletter, job-alert, search, login, cookie, and comment forms are never filled. The form is filled from the saved resume profile and explicitly supplied application answers, then submitted in the same action if real submissions are enabled.
 - **Manual:** Unsupported pages and safety blockers include the original application link. The assistant does not claim these applications were submitted.
 
 ## Auto-fill
@@ -124,11 +125,11 @@ The generic Playwright engine supports three modes:
 
 - `dry_run`: fill known fields and save a screenshot; never click Submit.
 - `review`: fill known fields and save a screenshot; leave the final decision to the user.
-- `submit`: allowed only after the user separately approves a reviewed form and `REAL_APPLY_ENABLED=true`. The engine refuses required blanks or unanswered questions and reports `submitted` only after detecting a portal confirmation.
+- `submit`: used for one-step apply when `REAL_APPLY_ENABLED=true`; the engine refuses required blanks or unanswered questions and reports `submitted` only after detecting a portal confirmation. With `REQUIRE_REVIEW=true`, submission still requires the separate review approval.
 
 An application form must have a resume/CV upload or at least three fields mapped to candidate profile details. An email-only form is not an application. `review_ready` additionally requires at least three filled fields and either an uploaded resume or filled name, email, and phone. The application record and UI link use the final employer/ATS URL; the report records the detected ATS, filled field labels, missing questions, and screenshot. Manual and failed results also retain a debug screenshot and discovered labels.
 
-In chat, say **“apply to job 3”** to see the portal plan, then confirm to open the form for review. The assistant shows the final application link, screenshot, filled field labels (never values), and any questions that need answers. Provide missing answers in chat; they are saved for this session and the form is re-run. A `review_ready` form is still **not submitted**. Say **“submit it”** or use the Submit button only after reviewing the form. The submit run reopens the stored final URL and reuses the reviewed answer snapshot. If more than one review is pending, AIJob asks which one. If `REAL_APPLY_ENABLED=false`, AIJob keeps the application in dry-run mode and does not submit.
+In chat, say **“apply to job 3”** or use the **Apply** button. The assistant shows the final application link, screenshot, filled field labels (never values), and any questions that need answers. If an answer is missing, provide the requested answers in chat; they are saved for this session and the form is re-run automatically. Submitted applications are reported only when the portal confirms receipt. When `REQUIRE_REVIEW=true`, the assistant instead asks for confirmation, shows the filled form for review, and requires a separate “submit it” request.
 
 Generate a cover letter only on request. The assistant returns the draft for review; it is included in an application only after the user explicitly approves it for that job.
 
@@ -145,11 +146,11 @@ The CLI opens a visible browser, prints the report, and stays open until Enter. 
 python scripts/autofill.py --export-profile <session_id>
 ```
 
-Safety limits: CAPTCHA (including reCAPTCHA, hCaptcha, and Turnstile), login/account creation/SSO, and LinkedIn, Indeed, Naukri, and Glassdoor are never automated or bypassed. EEO, disability, veteran, criminal-history, legal-attestation, privacy/consent, and free-text questions are never inferred or defaulted; they need explicit user-provided answers or must be completed manually. No stealth plugins, proxy rotation, fake user agents, account creation, or credential handling are used. The engine limits runs to one per domain every 30 seconds and at most five real application attempts per session per hour.
+Safety limits: CAPTCHA (including reCAPTCHA, hCaptcha, and Turnstile), login/account creation/SSO, and LinkedIn, Indeed, Naukri, and Glassdoor are never automated or bypassed. EEO, disability, veteran, criminal-history, legal-attestation, and free-text questions are never inferred or defaulted; they need explicit user-provided answers or must be completed manually. Marketing/newsletter opt-ins are always left unchecked. Terms/privacy checkboxes are selected only after the user explicitly consents and the answer is saved. No stealth plugins, proxy rotation, fake user agents, account creation, or credential handling are used. The engine waits for per-domain throttles and limits real submissions to five per session per hour.
 
 Known limits include custom widgets that do not expose standard inputs, pages requiring manual completion, and selectors or labels that may drift. Per-domain throttling waits up to 30 seconds and returns `retry_later` if the wait expires; that transient result preserves any reviewed status and preview. Always verify the screenshot and the original portal. Resume/profile/answer data and previews are personal data stored under `uploads/{session_id}/`; keep this gitignored directory private. Clearing a session removes its saved profile, applications, resume, and previews.
 
-To enable actual sending/submission, configure the SMTP values for email applications and set `REAL_APPLY_ENABLED=true`. Test with it disabled first. Keep the feature user-driven: one job at a time, only after explicit confirmation.
+To enable actual sending/submission, configure the SMTP values for email applications and set `REAL_APPLY_ENABLED=true`. Test with it disabled first. The assistant applies only when explicitly asked for a specific job, and makes at most one apply call per user message. Set `REQUIRE_REVIEW=true` to require an additional review and submit action.
 
 For hosted deployments use Postgres (Neon/Supabase URLs are supported) so profiles and applications survive service restarts and multiple instances. SQLite is intended for local development.
 
