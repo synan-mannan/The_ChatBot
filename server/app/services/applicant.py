@@ -12,7 +12,15 @@ from server.app.config import get_settings
 from server.app.models.schemas import Job, ResumeProfile
 
 ApplyMethod = Literal["email", "greenhouse", "lever", "autofill", "manual"]
-ApplyStatus = Literal["submitted", "dry_run", "review_ready", "needs_input", "needs_manual", "failed"]
+ApplyStatus = Literal[
+    "submitted",
+    "dry_run",
+    "review_ready",
+    "needs_input",
+    "needs_manual",
+    "failed",
+    "retry_later",
+]
 FORM_TIMEOUT_SECONDS = 45
 ACTION_TIMEOUT_MS = 8_000
 
@@ -447,6 +455,7 @@ async def apply(
             "needs_input": "The form needs user-provided answers before submission.",
             "needs_manual": report.blocker_reason or "Continue this application manually.",
             "failed": report.blocker_reason or "The form could not be completed; verify manually.",
+            "retry_later": report.blocker_reason or "Please retry the application shortly.",
             "submitted": "The portal confirmed receipt of the application.",
         }
         return ApplyResult(

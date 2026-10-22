@@ -76,12 +76,56 @@ async def test_duplicate_application_is_idempotent(database_session) -> None:
             "company": "Example Co",
             "applied_date": first["applied_date"],
             "status": "needs_manual",
-            "method": "manual",
+            "method": "autofill",
             "detail": first["detail"],
             "apply_url": "https://example.com/jobs/backend",
+            "filled": [],
+            "needs_input": [],
+            "screenshot_url": (
+                "/api/applications/1/preview"
+                "?session_id=anonymous-session-123"
+            ),
+            "detected_ats": "other",
+            "debug_screenshot_url": (
+                "/api/applications/1/debug-preview"
+                "?session_id=anonymous-session-123"
+            ),
         }
     ]
     assert database_session.get_bind().dialect.name == "sqlite"
+
+
+@pytest.mark.asyncio
+async def test_submit_pending_requires_a_single_reviewed_application(
+    database_session,
+) -> None:
+    jobs = [make_job("1"), make_job("2")]
+    store = SessionStore()
+    context = make_context(database_session, store, jobs)
+    database_session.add_all(
+        [
+            ApplicationRow(
+                session_id=context.session_id,
+                job_id=job.id,
+                status="review_ready",
+                method="autofill",
+                detail="Ready for review.",
+                apply_url=job.source_link,
+                report_data={"filled": []},
+            )
+            for job in jobs
+        ]
+    )
+    await database_session.commit()
+
+    result = await apply_to_job_tool(
+        context,
+        ApplyToJobInput(job_id="pending", submit=True),
+    )
+
+    assert result["status"] == "clarification_required"
+    assert "Backend Developer at Example Co (id:1)" in result["message"]
+    assert "Backend Developer at Example Co (id:2)" in result["message"]
 
 
 @pytest.mark.asyncio
@@ -152,6 +196,7 @@ async def test_failed_application_retry_reuses_the_same_database_row(
         return next(results)
 
     monkeypatch.setattr(application_tools, "apply", fake_apply)
+    monkeypatch.setattr(application_tools, "pick_method", lambda job: "manual")
 
     await apply_to_job_tool(context, ApplyToJobInput(job_id="1"))
     first_attempt = await apply_to_job_tool(

@@ -70,11 +70,14 @@ SESSION_HOUR = timedelta(hours=1)
 _RATE_LIMIT_LOCK = asyncio.Lock()
 _DOMAIN_RUNS: dict[str, datetime] = {}
 _SESSION_SUBMISSIONS: dict[str, list[datetime]] = {}
+_REVIEW_RUNS: dict[tuple[str, str, str], datetime] = {}
 logger = logging.getLogger(__name__)
 
 
 def clear_session_rate_limits(session_id: str) -> None:
     _SESSION_SUBMISSIONS.pop(session_id, None)
+    for key in [key for key in _REVIEW_RUNS if key[0] == session_id]:
+        _REVIEW_RUNS.pop(key, None)
 
 
 class FilledField(BaseModel):
@@ -97,6 +100,7 @@ class AutofillReport(BaseModel):
         "needs_input",
         "needs_manual",
         "failed",
+        "retry_later",
     ]
     filled: list[FilledField] = []
     needs_input: list[NeedsInputField] = []
@@ -971,7 +975,11 @@ def _review_readiness_reason(
 ) -> str | None:
     if len(filled) < 3:
         return "Fewer than three application fields were filled."
-    has_resume_input = any(field_info.field_type == "file" for field_info in fields)
+    has_resume_input = any(
+        field_info.field_type == "file"
+        and _deterministic_key(field_info) == "resume_path"
+        for field_info in fields
+    )
     filled_keys = {field_info.key for field_info in filled}
     if has_resume_input:
         if "resume_path" not in filled_keys:
@@ -1014,25 +1022,99 @@ async def _save_debug_artifacts(
         )
 
 
-async def _reserve_run(domain: str, session_id: str, mode: AutofillMode) -> str | None:
+async def _save_blocked_debug_artifacts(
+    report: AutofillReport,
+    *,
+    uploads_dir: str,
+    session_id: str,
+    job_id: str,
+) -> None:
+    directory = Path(uploads_dir) / session_id / "previews"
+    directory.mkdir(parents=True, exist_ok=True)
+    report.screenshot_path = str(directory / f"{job_id}.png")
+    report.debug_screenshot_path = str(directory / f"{job_id}-debug.png")
+    report.debug_labels_path = str(directory / f"{job_id}-labels.json")
+    try:
+        Path(report.debug_labels_path).write_text("[]\n", encoding="utf-8")
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content(
+                "<!doctype html><html><body><h1>Manual application required</h1>"
+                f"<p>{report.blocker_reason or 'Automation stopped.'}</p></body></html>"
+            )
+            await page.screenshot(path=report.screenshot_path, full_page=True)
+            await page.screenshot(path=report.debug_screenshot_path, full_page=True)
+            await browser.close()
+    except Exception as exc:
+        logger.warning("blocked autofill debug artifact save failed: %s", type(exc).__name__)
+        report.blocker_reason = (
+            f"{report.blocker_reason or 'Application stopped.'} "
+            f"Debug artifacts could not be saved ({type(exc).__name__})."
+        )
+
+
+async def _reserve_run(
+    domain: str,
+    session_id: str,
+    mode: AutofillMode,
+    job_id: str = "",
+    *,
+    count_submission: bool = True,
+    review_submit_exemption: bool = False,
+) -> str | None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + DOMAIN_INTERVAL.total_seconds()
+    while True:
+        now = datetime.now(timezone.utc)
+        wait_seconds = 0.0
+        async with _RATE_LIMIT_LOCK:
+            review_at = _REVIEW_RUNS.get((session_id, job_id, domain))
+            review_exemption = bool(
+                mode == "submit"
+                and (
+                    review_submit_exemption
+                    or (
+                        review_at
+                        and now - review_at <= timedelta(minutes=15)
+                    )
+                )
+            )
+            previous = _DOMAIN_RUNS.get(domain)
+            if (
+                previous
+                and now - previous < DOMAIN_INTERVAL
+                and not review_exemption
+            ):
+                wait_seconds = (DOMAIN_INTERVAL - (now - previous)).total_seconds()
+            else:
+                if mode == "submit" and count_submission:
+                    recent = [
+                        value
+                        for value in _SESSION_SUBMISSIONS.get(session_id, [])
+                        if now - value < SESSION_HOUR
+                    ]
+                    if len(recent) >= 5:
+                        return (
+                            "The maximum of five real application attempts per session "
+                            "per hour was reached."
+                        )
+                    recent.append(now)
+                    _SESSION_SUBMISSIONS[session_id] = recent
+                _DOMAIN_RUNS[domain] = now
+                return None
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return "The domain remained rate-limited after waiting up to 30 seconds."
+        await asyncio.sleep(min(wait_seconds, remaining))
+
+
+def _mark_review_run(session_id: str, job_id: str, domains: set[str]) -> None:
     now = datetime.now(timezone.utc)
-    async with _RATE_LIMIT_LOCK:
-        previous = _DOMAIN_RUNS.get(domain)
-        if previous and now - previous < DOMAIN_INTERVAL:
-            wait_seconds = int((DOMAIN_INTERVAL - (now - previous)).total_seconds()) + 1
-            return f"This domain is rate-limited. Try again in about {wait_seconds} seconds."
-        if mode == "submit":
-            recent = [
-                value
-                for value in _SESSION_SUBMISSIONS.get(session_id, [])
-                if now - value < SESSION_HOUR
-            ]
-            if len(recent) >= 5:
-                return "The maximum of five real application attempts per session per hour was reached."
-            recent.append(now)
-            _SESSION_SUBMISSIONS[session_id] = recent
-        _DOMAIN_RUNS[domain] = now
-    return None
+    for domain in domains:
+        _REVIEW_RUNS[(session_id, job_id, domain)] = now
 
 
 async def fill_application_form(
@@ -1049,36 +1131,72 @@ async def fill_application_form(
     real_apply_enabled: bool | None = None,
     headed: bool = False,
     approved_cover_letter: str | None = None,
+    review_submit_exemption: bool = False,
     keep_open: bool = False,
     on_report: Callable[[AutofillReport], None] | None = None,
 ) -> AutofillReport:
     parsed_url = urlsplit(url)
     hostname = parsed_url.hostname or ""
+    safe_identifiers = _safe_file_component(session_id) and _safe_file_component(job.id)
     if parsed_url.scheme not in {"http", "https"} or not hostname:
-        return AutofillReport(status="failed", blocker_reason="A valid HTTP(S) application URL is required.")
+        report = AutofillReport(
+            status="failed",
+            blocker_reason="A valid HTTP(S) application URL is required.",
+            final_url=url,
+        )
+        if safe_identifiers:
+            await _save_blocked_debug_artifacts(
+                report,
+                uploads_dir=uploads_dir,
+                session_id=session_id,
+                job_id=job.id,
+            )
+        return report
     if _blocked_domain(hostname):
-        return AutofillReport(
+        report = AutofillReport(
             status="needs_manual",
             blocker_reason="This career portal does not permit automated applications. Continue manually.",
             final_url=url,
+            detected_ats=_detected_ats(url),
         )
+        if safe_identifiers:
+            await _save_blocked_debug_artifacts(
+                report,
+                uploads_dir=uploads_dir,
+                session_id=session_id,
+                job_id=job.id,
+            )
+        return report
     if real_apply_enabled is None:
         real_apply_enabled = get_settings().real_apply_enabled
     if mode == "submit" and not real_apply_enabled:
         mode = "dry_run"
-    if not _safe_file_component(session_id) or not _safe_file_component(job.id):
+    if not safe_identifiers:
         return AutofillReport(
             status="failed",
             blocker_reason="The session or job identifier is not a safe file name.",
             final_url=url,
         )
-    rate_reason = await _reserve_run(hostname.casefold(), session_id, mode)
+    rate_reason = await _reserve_run(
+        hostname.casefold(),
+        session_id,
+        mode,
+        job.id,
+        review_submit_exemption=review_submit_exemption,
+    )
     if rate_reason:
-        return AutofillReport(status="failed", blocker_reason=rate_reason, final_url=url)
+        return AutofillReport(
+            status="retry_later",
+            blocker_reason=rate_reason,
+            final_url=url,
+            detected_ats=_detected_ats(url),
+        )
 
     playwright = None
     browser = None
     page = None
+    submit_clicked = False
+    reserved_domains = {hostname.casefold()}
     report = AutofillReport(status="failed", final_url=url)
     try:
         from playwright.async_api import async_playwright
@@ -1097,6 +1215,21 @@ async def fill_application_form(
                 report.status = "needs_manual"
                 report.blocker_reason = reason
                 return report
+            final_host = (urlsplit(page.url).hostname or "").casefold()
+            if final_host and final_host not in reserved_domains:
+                rate_reason = await _reserve_run(
+                    final_host,
+                    session_id,
+                    mode,
+                    job.id,
+                    count_submission=False,
+                    review_submit_exemption=review_submit_exemption,
+                )
+                if rate_reason:
+                    report.status = "retry_later"
+                    report.blocker_reason = rate_reason
+                    return report
+                reserved_domains.add(final_host)
             all_filled: list[FilledField] = []
             all_needs_input: list[NeedsInputField] = []
             form_identity = (fields[0].frame.url, fields[0].form_key)
@@ -1182,10 +1315,11 @@ async def fill_application_form(
 
             submit = await _submit_button(fields)
             if submit is None:
-                report.status = "failed"
+                report.status = "needs_manual"
                 report.blocker_reason = "No final submit button was found. Verify the form manually."
                 return report
             await submit.click(timeout=ACTION_TIMEOUT_MS)
+            submit_clicked = True
             await page.wait_for_timeout(1_500)
             report.final_url = page.url
             if await _confirmation_detected(page):
@@ -1195,17 +1329,35 @@ async def fill_application_form(
             report.blocker_reason = "Submission could not be confirmed; please verify manually."
             return report
     except TimeoutError:
-        report.status = "failed"
+        report.status = "retry_later"
         report.blocker_reason = "The application page timed out; please verify manually."
         if page is not None:
             report.final_url = page.url
         return report
     except Exception as exc:
-        report.status = "failed"
-        report.blocker_reason = (
-            f"The application form could not be completed ({type(exc).__name__}); "
-            "please verify manually."
+        exception_name = type(exc).__name__
+        exception_message = str(exc).casefold()
+        transient_browser_error = exception_name in {
+            "BrowserClosedError",
+            "BrowserDisconnectedError",
+            "TargetClosedError",
+        } or any(
+            marker in exception_message
+            for marker in (
+                "browser disconnected",
+                "browser has been closed",
+                "target page, context or browser has been closed",
+                "connection closed",
+                "target closed",
+            )
         )
+        report.status = (
+            "retry_later"
+            if transient_browser_error
+            else "failed" if submit_clicked
+            else "needs_manual"
+        )
+        report.blocker_reason = f"The application form could not be completed ({exception_name})."
         if page is not None:
             report.final_url = page.url
         logger.warning("autofill run failed: %s", type(exc).__name__)
@@ -1213,6 +1365,14 @@ async def fill_application_form(
     finally:
         try:
             report.detected_ats = _detected_ats(report.final_url or url)
+            if report.status == "review_ready":
+                _mark_review_run(
+                    session_id,
+                    job.id,
+                    reserved_domains | {
+                        (urlsplit(report.final_url or "").hostname or "").casefold()
+                    },
+                )
             if report.status in {"needs_manual", "failed"} and _safe_file_component(session_id) and _safe_file_component(job.id):
                 await _save_debug_artifacts(
                     page,
@@ -1233,12 +1393,16 @@ async def fill_application_form(
             if browser is not None:
                 try:
                     await browser.close()
-                except Exception:
-                    report.status = "failed"
-                    report.blocker_reason = "The browser could not close cleanly; verify manually."
+                except Exception as exc:
+                    logger.warning("autofill browser close failed: %s", type(exc).__name__)
+                    if report.status not in {"submitted", "review_ready", "needs_input"}:
+                        report.status = "retry_later"
+                        report.blocker_reason = "The browser could not close cleanly; try again later."
             if playwright is not None:
                 try:
                     await playwright.stop()
-                except Exception:
-                    report.status = "failed"
-                    report.blocker_reason = "The browser driver could not stop cleanly; verify manually."
+                except Exception as exc:
+                    logger.warning("autofill driver stop failed: %s", type(exc).__name__)
+                    if report.status not in {"submitted", "review_ready", "needs_input"}:
+                        report.status = "retry_later"
+                        report.blocker_reason = "The browser driver could not stop cleanly; try again later."

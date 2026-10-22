@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from functools import partial
+from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+from time import monotonic
 
 import pytest
 
@@ -167,6 +169,28 @@ async def test_single_email_listing_is_manual_and_saves_debug_artifacts(
 
 
 @pytest.mark.asyncio
+async def test_fewer_than_three_profile_fields_never_become_review_ready(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/two_fields.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(name="Ada Lovelace", email="ada@example.test"),
+        {},
+        None,
+        "review",
+        _job(url, "two-fields-job"),
+        session_id="session-two-fields",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "needs_manual"
+    assert report.status != "review_ready"
+    assert report.filled == []
+    assert report.screenshot_path and Path(report.screenshot_path).is_file()
+
+
+@pytest.mark.asyncio
 async def test_select_and_radio_answers_match_options(fixture_server, tmp_path) -> None:
     url = f"{fixture_server}/select_radio.html"
     report = await fill_application_form(
@@ -290,6 +314,9 @@ async def test_captcha_and_login_are_manual_blockers(
     assert report.status == "needs_manual"
     assert report.blocker_reason is not None
     assert reason.casefold() in report.blocker_reason.casefold()
+    assert report.final_url == url
+    assert report.debug_screenshot_path and Path(report.debug_screenshot_path).is_file()
+    assert report.debug_labels_path and Path(report.debug_labels_path).is_file()
 
 
 @pytest.mark.asyncio
@@ -454,8 +481,12 @@ async def test_submit_refuses_missing_required_and_blocked_domain(
         None,
         "review",
         _job("https://careers.linkedin.com/jobs/1"),
+        session_id="session-blocked-domain",
+        uploads_dir=str(tmp_path),
     )
     assert blocked.status == "needs_manual"
+    assert blocked.final_url == "https://careers.linkedin.com/jobs/1"
+    assert blocked.debug_screenshot_path and Path(blocked.debug_screenshot_path).is_file()
 
 
 @pytest.mark.asyncio
@@ -493,15 +524,51 @@ def test_llm_mapping_discards_invalid_keys_and_generated_values() -> None:
 
 
 @pytest.mark.asyncio
-async def test_domain_and_session_real_application_rate_limits() -> None:
+async def test_domain_and_session_real_application_rate_limits(monkeypatch) -> None:
+    monkeypatch.setattr(autofill, "DOMAIN_INTERVAL", timedelta(milliseconds=20))
     first = await autofill._reserve_run("example.test", "session-rate-123", "review")
+    started = monotonic()
     immediate_retry = await autofill._reserve_run(
         "example.test", "another-session-123", "review"
     )
 
     assert first is None
-    assert immediate_retry is not None
-    assert "rate-limited" in immediate_retry
+    assert immediate_retry is None
+    assert monotonic() - started >= 0.015
+
+    autofill._DOMAIN_RUNS.clear()
+    autofill._DOMAIN_RUNS["timeout.test"] = datetime.now(timezone.utc)
+
+    class ExpiredLoop:
+        calls = 0
+
+        def time(self) -> float:
+            self.calls += 1
+            return float(self.calls)
+
+    get_running_loop = autofill.asyncio.get_running_loop
+    monkeypatch.setattr(autofill.asyncio, "get_running_loop", ExpiredLoop)
+    timed_out = await autofill._reserve_run(
+        "timeout.test", "session-timeout", "review", "job-timeout"
+    )
+    assert timed_out is not None
+    assert "after waiting" in timed_out
+
+    autofill._DOMAIN_RUNS.clear()
+    monkeypatch.setattr(autofill.asyncio, "get_running_loop", get_running_loop)
+    autofill._REVIEW_RUNS.clear()
+    await autofill._reserve_run(
+        "review.test", "session-review", "review", "job-review"
+    )
+    autofill._mark_review_run(
+        "session-review", "job-review", {"review.test"}
+    )
+    started = monotonic()
+    exempt = await autofill._reserve_run(
+        "review.test", "session-review", "submit", "job-review"
+    )
+    assert exempt is None
+    assert monotonic() - started < 0.015
 
     autofill._DOMAIN_RUNS.clear()
     for index in range(5):
@@ -514,3 +581,29 @@ async def test_domain_and_session_real_application_rate_limits() -> None:
     )
     assert capped is not None
     assert "five real application attempts" in capped
+
+
+@pytest.mark.asyncio
+async def test_closed_browser_returns_retry_later(monkeypatch, tmp_path) -> None:
+    class ClosedBrowser:
+        async def start(self):
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    monkeypatch.setattr(
+        "playwright.async_api.async_playwright",
+        lambda: ClosedBrowser(),
+    )
+    url = "https://example.test/jobs/1"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(name="Ada Lovelace", email="ada@example.test"),
+        {},
+        None,
+        "review",
+        _job(url),
+        session_id="session-browser-crash",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "retry_later"
+    assert report.final_url == url

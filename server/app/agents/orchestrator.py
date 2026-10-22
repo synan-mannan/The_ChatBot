@@ -56,7 +56,9 @@ For applications, call apply_to_job first with confirm=false. Only call it again
 after the user explicitly agrees in a later message containing a clear affirmative confirmation.
 For generic employer career portals, this confirmation only prepares the form for review. If the
 form is review_ready, it is NOT submitted until the user explicitly says to submit it in a later
-message. If the report is needs_input, ask for that batch of missing answers; never invent them.
+message. “Submit it” resumes the single reviewed application from its stored final application
+URL; if multiple applications are reviewed, ask which one. If the report is needs_input, ask for
+that batch of missing answers; never invent them.
 Report exactly the status, filled field list, missing questions, blockers, and screenshot returned
 by the tool. Never claim submission unless the report status is submitted.
 For filters, preserve earlier active filters unless the user asks to remove or replace them.
@@ -113,6 +115,15 @@ def _normalized_short_reply(message: str) -> str:
 
 def _is_explicit_confirmation(message: str) -> bool:
     return _normalized_short_reply(message) in CONFIRMATION_PHRASES
+
+
+def _is_submit_instruction(message: str) -> bool:
+    return _normalized_short_reply(message) in {
+        "submit",
+        "submit it",
+        "submit the application",
+        "submit application",
+    }
 
 
 def _is_explicit_rejection(message: str) -> bool:
@@ -259,7 +270,11 @@ class Orchestrator:
                 definition = self._tools.get(call.name)
                 call_arguments = dict(call.arguments)
                 if call.name == "apply_to_job":
-                    if (
+                    if _is_submit_instruction(message):
+                        call_arguments["job_id"] = "pending"
+                        call_arguments["confirm"] = False
+                        call_arguments["submit"] = True
+                    elif (
                         state.pending_submission_job_id
                         and _is_explicit_confirmation(message)
                     ):

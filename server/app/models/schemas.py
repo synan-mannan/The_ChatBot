@@ -80,6 +80,11 @@ class ApplicationView(BaseModel):
     method: str = "manual"
     detail: str = ""
     apply_url: str | None = None
+    filled: list[dict[str, str]] = Field(default_factory=list)
+    needs_input: list[dict[str, Any]] = Field(default_factory=list)
+    screenshot_url: str | None = None
+    detected_ats: str | None = None
+    debug_screenshot_url: str | None = None
 
 
 class ApplicationConfirmation(BaseModel):
@@ -99,6 +104,7 @@ class ApplicationActionResponse(BaseModel):
         "needs_input",
         "needs_manual",
         "failed",
+        "retry_later",
         "duplicate",
         "not_found",
         "resume_required",
@@ -118,6 +124,11 @@ class ApplicationActionResponse(BaseModel):
     filled: list[dict[str, str]] = Field(default_factory=list)
     needs_input: list[dict[str, Any]] = Field(default_factory=list)
     blocker_reason: str | None = None
+    detected_ats: Literal[
+        "greenhouse", "lever", "ashby", "workable", "smartrecruiters", "workday", "other"
+    ] | None = None
+    discovered_form_labels: list[str] = Field(default_factory=list)
+    debug_screenshot_url: str | None = None
 
 
 class ToolCall(BaseModel):

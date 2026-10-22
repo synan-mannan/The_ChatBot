@@ -133,6 +133,41 @@ async def get_application_preview(
     return FileResponse(preview_path, media_type="image/png")
 
 
+@router.get("/applications/{job_id}/debug-preview", include_in_schema=True)
+async def get_application_debug_preview(
+    request: Request,
+    job_id: JobPath = PathParam(...),
+    session_id: SessionQuery = Query(...),
+    session: AsyncSession = Depends(get_database_session),
+) -> FileResponse:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", session_id):
+        raise HTTPException(status_code=404, detail="Application preview not found.")
+    uploads_root = Path(request.app.state.settings.uploads_dir).resolve()
+    session_directory = (uploads_root / session_id).resolve()
+    debug_path = (session_directory / "previews" / f"{job_id}-debug.png").resolve()
+    try:
+        session_directory.relative_to(uploads_root)
+        debug_path.relative_to(session_directory)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Application preview not found.") from exc
+    row = await session.scalar(
+        select(ApplicationRow).where(
+            ApplicationRow.session_id == session_id,
+            ApplicationRow.job_id == job_id,
+        )
+    )
+    report_path = (
+        Path(row.report_data["debug_screenshot_path"]).resolve()
+        if row is not None
+        and row.report_data is not None
+        and row.report_data.get("debug_screenshot_path")
+        else None
+    )
+    if row is None or report_path != debug_path or not debug_path.is_file():
+        raise HTTPException(status_code=404, detail="Application preview not found.")
+    return FileResponse(debug_path, media_type="image/png")
+
+
 @router.get("/applications", response_model=ApplicationsResponse)
 async def list_applications(
     request: Request,
@@ -170,6 +205,19 @@ async def list_applications(
             method=row.method,
             detail=row.detail,
             apply_url=row.apply_url,
+            filled=(row.report_data or {}).get("filled", []),
+            needs_input=(row.report_data or {}).get("needs_input", []),
+            screenshot_url=(
+                f"/api/applications/{row.job_id}/preview?session_id={session_id}"
+                if (row.report_data or {}).get("screenshot_path")
+                else None
+            ),
+            detected_ats=(row.report_data or {}).get("detected_ats"),
+            debug_screenshot_url=(
+                f"/api/applications/{row.job_id}/debug-preview?session_id={session_id}"
+                if (row.report_data or {}).get("debug_screenshot_path")
+                else None
+            ),
         )
         for row in rows
         if row.job_id in job_by_id
