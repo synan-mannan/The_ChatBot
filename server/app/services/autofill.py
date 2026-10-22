@@ -298,7 +298,7 @@ _NON_APPLICATION_FORM = re.compile(
     re.I,
 )
 _APPLY_CONTROL = re.compile(
-    r"^\s*apply(?:\s+now|\s+for this job|\s+on (?:the )?company(?: site)?|\s+here)?\s*$",
+    r"apply(?:\s+now|\s+for this job|\s+on (?:the )?company(?: site)?|\s+here)?",
     re.I,
 )
 _PROFILE_FORM_KEYS = ALLOWED_PROFILE_KEYS - {

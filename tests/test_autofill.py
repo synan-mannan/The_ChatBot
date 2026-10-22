@@ -117,6 +117,36 @@ async def test_aggregator_follow_external_apply_skips_job_alert_form(
 
 
 @pytest.mark.asyncio
+async def test_arbeitnow_apply_again_link_is_followed(
+    fixture_server, tmp_path
+) -> None:
+    url = f"{fixture_server}/apply_again.html"
+    report = await fill_application_form(
+        url,
+        ResumeProfile(
+            name="Ada Lovelace",
+            email="ada@example.test",
+            phone="+44 20 1234 5678",
+        ),
+        {},
+        None,
+        "review",
+        _job(url, "arbeitnow-apply-again"),
+        session_id="session-arbeitnow",
+        uploads_dir=str(tmp_path),
+    )
+
+    assert report.status == "review_ready"
+    assert report.final_url is not None
+    assert report.final_url.endswith("/application.html")
+    assert {field.label for field in report.filled} == {
+        "Full name",
+        "Email address",
+        "Phone number",
+    }
+
+
+@pytest.mark.asyncio
 async def test_popup_tracking_redirects_and_employer_apply_click(
     fixture_server, tmp_path
 ) -> None:
