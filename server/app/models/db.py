@@ -34,6 +34,7 @@ class ResumeProfileRow(Base):
 
     session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     profile_data: Mapped[dict] = mapped_column(JSON, nullable=False)
+    answers_data: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
@@ -79,6 +80,7 @@ async def initialize_database(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
         await connection.run_sync(_migrate_application_columns)
+        await connection.run_sync(_migrate_resume_profile_columns)
 
 
 def _migrate_application_columns(connection: Any) -> None:
@@ -103,6 +105,17 @@ def _migrate_application_columns(connection: Any) -> None:
             "ELSE detail END WHERE status = 'applied'"
         )
     )
+
+
+def _migrate_resume_profile_columns(connection: Any) -> None:
+    inspector = inspect(connection)
+    if "resume_profiles" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("resume_profiles")}
+    if "answers_data" not in columns:
+        connection.exec_driver_sql(
+            "ALTER TABLE resume_profiles ADD COLUMN answers_data JSON NOT NULL DEFAULT '{}'"
+        )
 
 
 async def get_db_session(

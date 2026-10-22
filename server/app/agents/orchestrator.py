@@ -21,6 +21,7 @@ from server.app.tools.applications import (
     APPLY_DEFINITION,
     LIST_DEFINITION,
 )
+from server.app.tools.application_answers import SAVE_APPLICATION_ANSWERS_DEFINITION
 from server.app.tools.base import ToolContext, ToolDefinition
 from server.app.tools.jobs import (
     DETAILS_DEFINITION,
@@ -57,6 +58,7 @@ TOOL_DEFINITIONS = [
     DETAILS_DEFINITION,
     APPLY_DEFINITION,
     LIST_DEFINITION,
+    SAVE_APPLICATION_ANSWERS_DEFINITION,
 ]
 CONFIRMATION_PHRASES = {
     "yes",
@@ -253,6 +255,10 @@ class Orchestrator:
                         if tool_output.get("status") == "ok"
                         else str(tool_output["message"])
                     )
+                    terminal_tool_result = True
+                    break
+                if call.name == "save_application_answers":
+                    reply = str(tool_output.get("message", ""))
                     terminal_tool_result = True
                     break
                 contents.append(self.model.format_tool_response(call, tool_output))

@@ -34,8 +34,9 @@ async def apply_to_job(
     state = store.get(body.session_id)
     if state.profile is None:
         profile_row = await session.get(ResumeProfileRow, body.session_id)
-        if profile_row is not None:
+        if profile_row is not None and profile_row.profile_data:
             state.profile = ResumeProfile.model_validate(profile_row.profile_data)
+            state.answers = profile_row.answers_data or {}
     if state.profile is not None:
         await restore_resume_path(
             state, body.session_id, request.app.state.settings.uploads_dir
@@ -64,11 +65,12 @@ async def list_applications(
     state = store.get(session_id)
     if state.profile is None:
         profile_row = await session.get(ResumeProfileRow, session_id)
-        if profile_row is None:
+        if profile_row is None or not profile_row.profile_data:
             return ApplicationsResponse(
                 message="Please upload a resume before viewing applications."
             )
         state.profile = ResumeProfile.model_validate(profile_row.profile_data)
+        state.answers = profile_row.answers_data or {}
     await restore_resume_path(
         state, session_id, request.app.state.settings.uploads_dir
     )

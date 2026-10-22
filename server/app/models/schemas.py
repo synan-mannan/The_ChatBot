@@ -14,8 +14,21 @@ class ResumeProfile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
     email: str | None = None
     phone: str | None = None
+    city: str | None = None
+    country: str | None = None
+    linkedin_url: str | None = None
+    github_url: str | None = None
+    portfolio_url: str | None = None
+    current_company: str | None = None
+    current_title: str | None = None
+    total_experience_years: float | None = Field(default=None, ge=0, le=70)
+    highest_education: str | None = None
+    college: str | None = None
+    graduation_year: int | None = Field(default=None, ge=1900, le=2200)
     designation: str | None = None
     skills: list[str] = Field(default_factory=list)
     experience_years: float | None = Field(default=None, ge=0, le=70)

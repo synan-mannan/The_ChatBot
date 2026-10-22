@@ -31,7 +31,9 @@ async def _restore_profile(
             select(ResumeProfileRow).where(ResumeProfileRow.session_id == session_id)
         )
         if row is not None:
-            state.profile = ResumeProfile.model_validate(row.profile_data)
+            if row.profile_data:
+                state.profile = ResumeProfile.model_validate(row.profile_data)
+            state.answers = row.answers_data or {}
     if state.profile is not None:
         await restore_resume_path(state, session_id, uploads_dir)
 

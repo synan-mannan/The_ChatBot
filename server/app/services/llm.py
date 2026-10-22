@@ -75,10 +75,15 @@ def _retryable(exc: BaseException) -> bool:
 def _profile_prompt(resume_text: str) -> str:
     schema = json.dumps(ResumeProfile.model_json_schema(), ensure_ascii=False)
     return (
-        "Extract only facts explicitly supported by the resume text. Return exactly one JSON "
+        "Extract only facts explicitly supported by the resume text. Never infer or invent "
+        "personal details; for every absent or uncertain scalar use null. Return exactly one JSON "
         "object matching this JSON Schema. Do not use markdown or add fields. "
         "For unknown values, use null for nullable scalar fields and [] for arrays. "
         "experience_years must be a JSON number (not text such as '5 years') or null. "
+        "total_experience_years must be a JSON number or null. "
+        "first_name, last_name, phone, city, country, linkedin_url, github_url, portfolio_url, "
+        "current_company, current_title, highest_education, college, and graduation_year must "
+        "be filled only when directly supported by the resume; otherwise use null. "
         "skills, education, and projects must be arrays of strings.\n\n"
         f"JSON SCHEMA:\n{schema}\n\nRESUME TEXT:\n{resume_text}"
     )

@@ -11,6 +11,7 @@ from server.app.models.schemas import JobFilters, JobRecommendation, ResumeProfi
 @dataclass
 class SessionState:
     profile: ResumeProfile | None = None
+    answers: dict[str, str | bool | float] = field(default_factory=dict)
     resume_path: str | None = None
     filters: JobFilters = field(default_factory=JobFilters)
     last_shown_jobs: list[JobRecommendation] = field(default_factory=list)
@@ -27,6 +28,13 @@ class SessionStore:
     def set_profile(self, session_id: str, profile: ResumeProfile) -> SessionState:
         state = self.get(session_id)
         state.profile = profile
+        return state
+
+    def set_answers(
+        self, session_id: str, answers: dict[str, str | bool | float]
+    ) -> SessionState:
+        state = self.get(session_id)
+        state.answers.update(answers)
         return state
 
     def set_filters(self, session_id: str, filters: JobFilters) -> SessionState:

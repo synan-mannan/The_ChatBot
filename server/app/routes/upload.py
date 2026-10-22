@@ -91,7 +91,11 @@ async def upload_resume(
 
     row = await session.get(ResumeProfileRow, session_id)
     if row is None:
-        row = ResumeProfileRow(session_id=session_id, profile_data=profile.model_dump(mode="json"))
+        row = ResumeProfileRow(
+            session_id=session_id,
+            profile_data=profile.model_dump(mode="json"),
+            answers_data={},
+        )
         session.add(row)
     else:
         row.profile_data = profile.model_dump(mode="json")
