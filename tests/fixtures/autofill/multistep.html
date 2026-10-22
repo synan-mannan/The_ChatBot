@@ -1,0 +1,24 @@
+<!doctype html>
+<html><body>
+  <form id="application">
+    <section id="step-one">
+      <label>First name <input name="first_name" required></label>
+      <button type="button" id="next">Next</button>
+    </section>
+    <section id="step-two" hidden>
+      <label>Email address <input type="email" name="email" required></label>
+      <button type="submit">Submit</button>
+    </section>
+  </form>
+  <div id="confirmation" hidden>Thank you, your application has been received.</div>
+  <script>
+    document.querySelector("#next").addEventListener("click", () => {
+      document.querySelector("#step-one").hidden = true;
+      document.querySelector("#step-two").hidden = false;
+    });
+    document.querySelector("#application").addEventListener("submit", event => {
+      event.preventDefault();
+      document.querySelector("#confirmation").hidden = false;
+    });
+  </script>
+</body></html>

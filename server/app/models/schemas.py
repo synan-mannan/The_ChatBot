@@ -95,6 +95,8 @@ class ApplicationActionResponse(BaseModel):
         "in_progress",
         "submitted",
         "dry_run",
+        "review_ready",
+        "needs_input",
         "needs_manual",
         "failed",
         "duplicate",
@@ -112,6 +114,10 @@ class ApplicationActionResponse(BaseModel):
     applied_date: datetime | None = None
     apply_url: str | None = None
     application_status: str | None = None
+    screenshot_url: str | None = None
+    filled: list[dict[str, str]] = Field(default_factory=list)
+    needs_input: list[dict[str, Any]] = Field(default_factory=list)
+    blocker_reason: str | None = None
 
 
 class ToolCall(BaseModel):
