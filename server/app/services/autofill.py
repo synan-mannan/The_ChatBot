@@ -68,6 +68,14 @@ FORM_TIMEOUT_SECONDS = 60
 ACTION_TIMEOUT_MS = 8_000
 DOMAIN_INTERVAL = timedelta(seconds=30)
 SESSION_HOUR = timedelta(hours=1)
+# Open-application session limits (browser stays open while the user answers).
+OPEN_APP_IDLE_TIMEOUT = timedelta(minutes=30)
+MAX_OPEN_APPLICATIONS = 3
+MAX_FORM_STEPS = 8
+_MAINTENANCE_INTERVAL_SECONDS = 2
+_SUBMITTED_CLOSE_DELAY_SECONDS = 3
+_MAX_FINISHED_REPORTS = 50
+_PARKABLE_STATUSES = {"needs_input", "needs_manual", "review_ready", "dry_run"}
 _RATE_LIMIT_LOCK = asyncio.Lock()
 _DOMAIN_RUNS: dict[str, datetime] = {}
 _SESSION_SUBMISSIONS: dict[str, list[datetime]] = {}
@@ -114,9 +122,18 @@ class AutofillReport(BaseModel):
     debug_screenshot_path: str | None = None
     discovered_form_labels: list[str] = []
     debug_labels_path: str | None = None
+    # True while the browser window is still open and waiting for the user.
+    awaiting_user: bool = False
+    session_open: bool = False
+    # label -> answer for fields the AI filled, so the chat can show them for review.
+    ai_answers: dict[str, str] = {}
 
 
 class MappingOutput(RootModel[dict[str, str | None]]):
+    pass
+
+
+class AnswerOutput(RootModel[dict[str, str | None]]):
     pass
 
 
@@ -198,6 +215,12 @@ def _safe_file_component(value: str) -> bool:
     return re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) is not None
 
 
+def _strip_json_fence(raw: str) -> str:
+    candidate = raw.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, re.I | re.S)
+    return fenced.group(1) if fenced else candidate
+
+
 def _parse_mapping_output(raw: str) -> dict[str, str]:
     candidate = raw.strip()
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, re.I | re.S)
@@ -211,6 +234,18 @@ def _parse_mapping_output(raw: str) -> dict[str, str]:
         label: key
         for label, key in output.items()
         if key in ALLOWED_MAPPING_KEYS
+    }
+
+
+def _parse_answer_output(raw: str) -> dict[str, str]:
+    try:
+        output = AnswerOutput.model_validate_json(_strip_json_fence(raw)).root
+    except (ValidationError, ValueError) as exc:
+        raise FieldMappingError("The AI returned invalid answers.") from exc
+    return {
+        label: answer.strip()
+        for label, answer in output.items()
+        if isinstance(answer, str) and answer.strip()
     }
 
 
@@ -248,7 +283,15 @@ def _deterministic_key(field: FormField) -> str | None:
         ("work_authorization", (r"\b(work authorization|authorized to work|right to work)\b",)),
         ("requires_sponsorship", (r"\b(sponsorship|visa sponsorship)\b",)),
         ("notice_period", (r"\bnotice period\b",)),
-        ("expected_salary", (r"\b(expected|desired|salary expectation|salary requirement)\b",)),
+        # "expected" / "desired" alone also matched "expected degree classification",
+        # which would have typed the salary answer into that field.
+        (
+            "expected_salary",
+            (
+                r"\b(?:expected|desired)\s+(?:salary|compensation|pay|ctc|package)\b",
+                r"\bsalary\s+(?:expectation|requirement)s?\b",
+            ),
+        ),
         ("current_salary", (r"\b(current salary|current compensation)\b",)),
         ("willing_to_relocate", (r"\b(relocat|willing to move)\b",)),
         ("earliest_start_date", (r"\b(start date|available to start|earliest start)\b",)),
@@ -1001,24 +1044,26 @@ def _checkbox_answer(field_info: FormField, answer: str) -> bool | None:
     return normalized_answer == _normalize(field_info.label)
 
 
+async def _field_empty(field_info: FormField) -> bool:
+    if field_info.field_type == "radio":
+        return not any(
+            [await control.is_checked() for control in field_info.controls]
+        )
+    if field_info.field_type == "checkbox":
+        return not await field_info.controls[0].is_checked()
+    if field_info.field_type == "file":
+        return not await field_info.controls[0].evaluate(
+            "element => Boolean(element.files && element.files.length)"
+        )
+    return not (await field_info.controls[0].input_value()).strip()
+
+
 async def _required_fields_missing(fields: list[FormField]) -> list[NeedsInputField]:
     missing: list[NeedsInputField] = []
     for field_info in fields:
         if not field_info.visible or not field_info.required:
             continue
-        if field_info.field_type == "radio":
-            empty = not any(
-                [await control.is_checked() for control in field_info.controls]
-            )
-        elif field_info.field_type == "checkbox":
-            empty = not await field_info.controls[0].is_checked()
-        elif field_info.field_type == "file":
-            empty = not await field_info.controls[0].evaluate(
-                "element => Boolean(element.files && element.files.length)"
-            )
-        else:
-            empty = not (await field_info.controls[0].input_value()).strip()
-        if empty:
+        if await _field_empty(field_info):
             missing.append(_needs_input(field_info))
     return missing
 
@@ -1047,20 +1092,45 @@ async def _next_button(fields: list[FormField]) -> Any | None:
     return None
 
 
+_SUBMIT_LABEL = re.compile(
+    r"^\s*(submit(?:\s+(?:your\s+)?application)?|send\s+application|"
+    r"finish\s+application|complete\s+application|submit\s+and\s+apply|"
+    r"apply(?:\s+now|\s+for\s+this\s+job)?)\s*$",
+    re.I,
+)
+_NOT_SUBMIT_LABEL = re.compile(
+    r"next|continue|back|previous|save|draft|review|cancel", re.I
+)
+
+
 async def _submit_button(fields: list[FormField]) -> Any | None:
-    pattern = re.compile(r"^\s*(submit|submit application|send application|finish application)\s*$", re.I)
     if not fields:
         return None
     scope = _form_scope(fields[0])
-    candidates = scope.get_by_role("button", name=pattern)
+    candidates = scope.get_by_role("button", name=_SUBMIT_LABEL)
     for index in range(await candidates.count()):
         candidate = candidates.nth(index)
         if await candidate.is_visible():
             return candidate
-    candidates = scope.locator('input[type="submit"]')
-    if await candidates.count():
-        return candidates.first
+    # Fallback: any enabled submit-type control whose label isn't a Next/Back style button.
+    fallback = scope.locator(
+        'button[type="submit"]:not([disabled]), input[type="submit"]:not([disabled])'
+    )
+    for index in range(await fallback.count()):
+        candidate = fallback.nth(index)
+        if not await candidate.is_visible():
+            continue
+        label = (await candidate.inner_text()).strip() or (
+            await candidate.get_attribute("value") or ""
+        )
+        if not _NOT_SUBMIT_LABEL.search(label):
+            return candidate
     return None
+
+_CONFIRMATION_PATTERN = (
+    r"thank you|application (?:has been )?(?:received|submitted)|"
+    r"received your application|successfully submitted"
+)
 
 
 async def _confirmation_detected(page: Any) -> bool:
@@ -1070,14 +1140,18 @@ async def _confirmation_detected(page: Any) -> bool:
             for frame in page.frames
         ]
     )
-    return bool(
-        re.search(
-            r"thank you|application (?:has been )?(?:received|submitted)|"
-            r"received your application|successfully submitted",
-            text,
-            re.I,
-        )
-    )
+    return bool(re.search(_CONFIRMATION_PATTERN, text, re.I))
+
+
+async def _confirmation_text_present(page: Any) -> bool:
+    """Tolerant variant used while watching an open page (ignores frames that error)."""
+    chunks: list[str] = []
+    for frame in list(page.frames):
+        try:
+            chunks.append(await frame.locator("body").inner_text(timeout=1_500))
+        except Exception:
+            continue
+    return bool(re.search(_CONFIRMATION_PATTERN, "\n".join(chunks), re.I))
 
 
 def _review_readiness_reason(
@@ -1245,6 +1319,651 @@ async def _reserve_submission(session_id: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Open-application sessions: the browser stays open while the user answers
+# unknown fields (AI fill or manual) and until the application is submitted.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OpenApplication:
+    session_id: str
+    job_id: str
+    playwright: Any
+    browser: Any
+    page: Any
+    fields: list[FormField]
+    form_identity: tuple[str, str] | None
+    profile: ResumeProfile
+    job: Job
+    answers: dict[str, str | bool | float]
+    resume_path: str | None
+    approved_cover_letter: str | None
+    mode: AutofillMode
+    uploads_dir: str
+    report: AutofillReport
+    filled: list[FilledField] = field(default_factory=list)
+    skipped: set[tuple[str, str]] = field(default_factory=set)
+    steps_used: int = 0
+    baseline_url: str = ""
+    baseline_confirmation: bool = False
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_activity: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+_OPEN_APPLICATIONS: dict[tuple[str, str], OpenApplication] = {}
+_FINISHED_REPORTS: dict[tuple[str, str], AutofillReport] = {}
+_MAINTENANCE_TASK: asyncio.Task[None] | None = None
+_CLOSED_REASON = (
+    "The browser window was closed before submission was confirmed. "
+    "Verify the application manually."
+)
+
+
+def _touch(app: OpenApplication) -> None:
+    app.last_activity = datetime.now(timezone.utc)
+
+
+def _remember_finished(key: tuple[str, str], report: AutofillReport) -> None:
+    _FINISHED_REPORTS[key] = report
+    while len(_FINISHED_REPORTS) > _MAX_FINISHED_REPORTS:
+        _FINISHED_REPORTS.pop(next(iter(_FINISHED_REPORTS)))
+
+
+async def _shutdown_application(app: OpenApplication) -> None:
+    try:
+        await app.browser.close()
+    except Exception as exc:
+        logger.warning("autofill browser close failed: %s", type(exc).__name__)
+    try:
+        await app.playwright.stop()
+    except Exception as exc:
+        logger.warning("autofill driver stop failed: %s", type(exc).__name__)
+
+
+def _mark_finished(
+    app: OpenApplication,
+    status: Literal["submitted", "needs_manual", "retry_later", "failed"],
+    reason: str | None = None,
+) -> None:
+    key = (app.session_id, app.job_id)
+    _OPEN_APPLICATIONS.pop(key, None)
+    report = app.report
+    report.status = status
+    report.blocker_reason = reason
+    if status == "submitted":
+        report.needs_input = []
+    report.awaiting_user = False
+    report.session_open = False
+    try:
+        report.final_url = app.page.url
+    except Exception:
+        pass
+    _remember_finished(key, report)
+
+
+async def close_application(session_id: str, job_id: str) -> bool:
+    """Cancel an open application and close its browser. Returns False if none was open."""
+    app = _OPEN_APPLICATIONS.pop((session_id, job_id), None)
+    if app is None:
+        return False
+    app.report.awaiting_user = False
+    app.report.session_open = False
+    await _shutdown_application(app)
+    return True
+
+
+async def close_session_applications(session_id: str) -> int:
+    """Close every open application of a session (call this from session teardown)."""
+    closed = 0
+    for sid, jid in [key for key in _OPEN_APPLICATIONS if key[0] == session_id]:
+        if await close_application(sid, jid):
+            closed += 1
+    return closed
+
+
+async def _submission_detected(app: OpenApplication) -> bool:
+    # "thank you" can appear on the form itself, so only trust a confirmation that
+    # was not already on the page when the session opened, or that came with a URL change.
+    try:
+        if not await _confirmation_text_present(app.page):
+            return False
+        return (not app.baseline_confirmation) or app.page.url != app.baseline_url
+    except Exception:
+        return False
+
+
+def _ensure_maintenance_task() -> None:
+    global _MAINTENANCE_TASK
+    if _MAINTENANCE_TASK is None or _MAINTENANCE_TASK.done():
+        _MAINTENANCE_TASK = asyncio.get_running_loop().create_task(
+            _maintain_open_applications()
+        )
+
+
+async def _maintain_open_applications() -> None:
+    while _OPEN_APPLICATIONS:
+        await asyncio.sleep(_MAINTENANCE_INTERVAL_SECONDS)
+        for key, app in list(_OPEN_APPLICATIONS.items()):
+            if _OPEN_APPLICATIONS.get(key) is not app or app.lock.locked():
+                continue
+            try:
+                await _maintain_one(app)
+            except Exception as exc:
+                logger.warning("autofill session maintenance failed: %s", type(exc).__name__)
+
+
+async def _maintain_one(app: OpenApplication) -> None:
+    if app.page.is_closed() or not app.browser.is_connected():
+        _mark_finished(app, "needs_manual", _CLOSED_REASON)
+        await _shutdown_application(app)
+        return
+    if datetime.now(timezone.utc) - app.last_activity > OPEN_APP_IDLE_TIMEOUT:
+        minutes = int(OPEN_APP_IDLE_TIMEOUT.total_seconds() // 60)
+        _mark_finished(
+            app,
+            "retry_later",
+            f"The open application was closed after {minutes} minutes of inactivity.",
+        )
+        await _shutdown_application(app)
+        return
+    if await _submission_detected(app):
+        _mark_finished(app, "submitted")
+        await asyncio.sleep(_SUBMITTED_CLOSE_DELAY_SECONDS)
+        await _shutdown_application(app)
+
+
+async def _park_application(
+    *,
+    session_id: str,
+    job: Job,
+    playwright: Any,
+    browser: Any,
+    page: Any,
+    fields: list[FormField],
+    form_identity: tuple[str, str] | None,
+    filled: list[FilledField],
+    profile: ResumeProfile,
+    answers: dict[str, str | bool | float],
+    resume_path: str | None,
+    approved_cover_letter: str | None,
+    mode: AutofillMode,
+    uploads_dir: str,
+    report: AutofillReport,
+    steps_used: int,
+) -> None:
+    try:
+        baseline = await _confirmation_text_present(page)
+    except Exception:
+        baseline = False
+    app = OpenApplication(
+        session_id=session_id,
+        job_id=job.id,
+        playwright=playwright,
+        browser=browser,
+        page=page,
+        fields=list(fields),
+        form_identity=form_identity,
+        profile=profile,
+        job=job,
+        answers=answers,
+        resume_path=resume_path,
+        approved_cover_letter=approved_cover_letter,
+        mode=mode,
+        uploads_dir=uploads_dir,
+        report=report,
+        filled=list(filled),
+        steps_used=steps_used,
+        baseline_url=page.url,
+        baseline_confirmation=baseline,
+    )
+    report.awaiting_user = True
+    report.session_open = True
+    _OPEN_APPLICATIONS[(session_id, job.id)] = app
+    _ensure_maintenance_task()
+
+
+def _candidate_facts(profile: ResumeProfile) -> dict[str, Any]:
+    experience_years = (
+        profile.total_experience_years
+        if profile.total_experience_years is not None
+        else profile.experience_years
+    )
+    return {
+        "name": profile.name,
+        "current_title": profile.current_title or profile.designation,
+        "current_company": profile.current_company,
+        "experience_years": experience_years,
+        "experience_summary": profile.experience_summary,
+        "skills": profile.skills,
+        "education": profile.education,
+        "projects": profile.projects,
+    }
+
+
+async def _refresh_fields(app: OpenApplication) -> None:
+    """Re-discover the current step so locators are fresh and revealed fields show up."""
+    if app.form_identity is None:
+        return
+    step_fields = await _discover_fields(list(app.page.frames))
+    fresh = [
+        field_info
+        for field_info in step_fields
+        if (field_info.frame.url, field_info.form_key) == app.form_identity
+    ]
+    if fresh:
+        app.fields = fresh
+
+
+async def _recompute_pending(app: OpenApplication) -> list[FormField]:
+    """Fields still empty that were asked about (or are required), minus skipped ones."""
+    asked = {(item.label, item.type) for item in app.report.needs_input}
+    pending: list[FormField] = []
+    for field_info in app.fields:
+        ident = (field_info.label, field_info.field_type)
+        if not field_info.visible or ident in app.skipped:
+            continue
+        if ident not in asked and not field_info.required:
+            continue
+        try:
+            empty = await _field_empty(field_info)
+        except Exception:
+            continue
+        if empty:
+            pending.append(field_info)
+    return pending
+
+
+async def _fill_step(app: OpenApplication, model: Any | None) -> None:
+    """Fill a NEW step (never call on a step that is already filled: typing would append)."""
+    mapping = await _field_mapping(app.fields, model)
+    filled, missing = await _fill_fields(
+        app.fields,
+        mapping,
+        app.profile,
+        app.answers,
+        app.resume_path,
+        app.approved_cover_letter,
+    )
+    app.filled.extend(filled)
+    needs: dict[tuple[str, str], NeedsInputField] = {
+        (item.label, item.type): item for item in missing
+    }
+    for item in await _required_fields_missing(app.fields):
+        needs[(item.label, item.type)] = item
+    app.report.needs_input = list(needs.values())
+
+
+async def _llm_fill(
+    app: OpenApplication, labels: set[str], model: Any | None
+) -> list[str]:
+    if model is None:
+        raise FieldMappingError("No AI model is configured.")
+    eligible: list[FormField] = []
+    for field_info in app.fields:
+        if field_info.label not in labels or not field_info.visible:
+            continue
+        if field_info.field_type in {"file", "checkbox"}:
+            continue
+        # Demographic, consent, legal and stored-answer questions are never AI-filled.
+        if _sensitive_question(field_info):
+            continue
+        if _deterministic_key(field_info) in ALLOWED_ANSWER_KEYS:
+            continue
+        if not await _field_empty(field_info):
+            continue
+        eligible.append(field_info)
+    if not eligible:
+        return []
+    descriptions = [
+        {
+            "label": item.label,
+            "type": item.field_type,
+            "options": [label for label, _ in item.options],
+        }
+        for item in eligible
+    ]
+    prompt = (
+        "Answer each application-form question using ONLY explicit facts from the candidate "
+        "profile and the job description. Never invent experience, grades, dates, "
+        "achievements, qualifications, preferences or personal facts. If the facts do not "
+        "support an answer, use null. For questions with options, answer with exactly one "
+        "of the listed options. Keep free-text answers concise (under 120 words), in first "
+        "person. Return only a JSON object whose keys are the exact question labels and "
+        "whose values are the answer string or null.\n"
+        f"JOB TITLE: {app.job.title}\nCOMPANY: {app.job.company}\n"
+        f"JOB DESCRIPTION:\n{str(app.job.description)[:6000]}\n"
+        f"CANDIDATE PROFILE FACTS:\n{json.dumps(_candidate_facts(app.profile), ensure_ascii=False)}\n"
+        f"QUESTIONS: {json.dumps(descriptions, ensure_ascii=False)}"
+    )
+    turn = await model.generate_chat(
+        contents=[prompt],
+        tools=[],
+        system_instruction=(
+            "You answer job-application questions using only the supplied candidate facts. "
+            "Return null whenever the facts do not explicitly support an answer. "
+            "Do not claim the application has been approved or submitted."
+        ),
+    )
+    ai_answers = _parse_answer_output(turn.text)
+    done: list[str] = []
+    for field_info in eligible:
+        answer = ai_answers.get(field_info.label)
+        if not answer:
+            continue
+        try:
+            if field_info.field_type == "radio":
+                match = _option_match(answer, field_info.options)
+                if match is None:
+                    continue
+                await field_info.controls[field_info.options.index(match)].check(
+                    timeout=ACTION_TIMEOUT_MS
+                )
+            elif field_info.field_type in {"select", "select-one"}:
+                match = _option_match(answer, field_info.options)
+                if match is None:
+                    continue
+                await field_info.controls[0].select_option(
+                    label=match[0], timeout=ACTION_TIMEOUT_MS
+                )
+            else:
+                await field_info.controls[0].fill(answer, timeout=ACTION_TIMEOUT_MS)
+        except Exception as exc:
+            logger.info("autofill AI fill skipped a field: %s", type(exc).__name__)
+            continue
+        app.filled.append(FilledField(label=field_info.label, key="ai_answer"))
+        app.report.ai_answers[field_info.label] = answer
+        done.append(field_info.label)
+    return done
+
+
+async def _advance_steps(
+    app: OpenApplication, model: Any | None
+) -> tuple[list[FormField], str | None]:
+    """Click Next/Continue while the step is complete. Returns (pending fields, blocker)."""
+    while app.steps_used < MAX_FORM_STEPS:
+        next_control = await _next_button(app.fields)
+        if next_control is None:
+            break
+        await next_control.click(timeout=ACTION_TIMEOUT_MS)
+        app.steps_used += 1
+        await app.page.wait_for_timeout(350)
+        reason = await _blocker_reason(list(app.page.frames), app.page.url)
+        if reason:
+            return [], reason
+        step_fields = await _discover_fields(list(app.page.frames))
+        fresh = [
+            field_info
+            for field_info in step_fields
+            if (field_info.frame.url, field_info.form_key) == app.form_identity
+        ]
+        if not fresh:
+            break
+        app.fields = fresh
+        await _fill_step(app, model)
+        pending = await _recompute_pending(app)
+        if pending:
+            return pending, None
+    return [], None
+
+
+_PENDING_REASON = "Some answers need your input before submission."
+
+
+async def resume_application(
+    session_id: str,
+    job_id: str,
+    decisions: dict[str, str] | None = None,
+    *,
+    model: Any | None = None,
+) -> AutofillReport:
+    """Continue an open application after the user answers in chat.
+
+    ``decisions`` maps a field label to ``"llm"`` (fill with AI), ``"manual"`` (the user
+    will type it in the open browser) or ``"skip"`` (leave an optional field empty).
+    Nothing is ever submitted here; the user clicks Submit in the open browser.
+    """
+    key = (session_id, job_id)
+    app = _OPEN_APPLICATIONS.get(key)
+    if app is None:
+        finished = _FINISHED_REPORTS.get(key)
+        if finished is not None:
+            return finished.model_copy(deep=True)
+        return AutofillReport(
+            status="failed",
+            blocker_reason="No open application was found for this session. Start it again.",
+        )
+    async with app.lock:
+        if _OPEN_APPLICATIONS.get(key) is not app:
+            return app.report.model_copy(deep=True)
+        _touch(app)
+        try:
+            await _resume_locked(app, decisions or {}, model)
+        except Exception as exc:
+            logger.warning("autofill resume failed: %s", type(exc).__name__)
+            if app.report.session_open:
+                app.report.status = "needs_manual"
+                app.report.blocker_reason = (
+                    f"The open application could not be updated ({type(exc).__name__}). "
+                    "The browser is still open; continue manually."
+                )
+        return app.report.model_copy(deep=True)
+
+
+async def _resume_locked(
+    app: OpenApplication, decisions: dict[str, str], model: Any | None
+) -> None:
+    report = app.report
+    page = app.page
+    if page.is_closed():
+        _mark_finished(app, "needs_manual", _CLOSED_REASON)
+        await _shutdown_application(app)
+        return
+    if await _submission_detected(app):
+        _mark_finished(app, "submitted")
+        await _shutdown_application(app)
+        return
+
+    llm_labels: set[str] = set()
+    for label, choice in decisions.items():
+        decision = str(choice).strip().casefold()
+        if decision == "llm":
+            llm_labels.add(label)
+        elif decision == "skip":
+            for field_info in app.fields:
+                if field_info.label == label:
+                    app.skipped.add((field_info.label, field_info.field_type))
+
+    if not app.fields:
+        # Parked on a blocker (CAPTCHA, login, no form yet): re-check now that the user acted.
+        reason = await _blocker_reason(list(page.frames), page.url)
+        if reason:
+            report.status = "needs_manual"
+            report.blocker_reason = reason
+            return
+        fields, _ = await _wait_for_form_fields(page, 5.0)
+        if not fields:
+            report.status = "needs_manual"
+            report.blocker_reason = f"No application form found on {page.url}"
+            return
+        app.fields = fields
+        app.form_identity = (fields[0].frame.url, fields[0].form_key)
+        await _fill_step(app, model)
+    else:
+        await _refresh_fields(app)
+
+    ai_note: str | None = None
+    if llm_labels:
+        try:
+            await _llm_fill(app, llm_labels, model)
+        except Exception as exc:
+            logger.warning("autofill AI fill failed: %s", type(exc).__name__)
+            ai_note = (
+                "The AI could not fill those fields; please fill them manually "
+                "in the open browser."
+            )
+
+    pending = await _recompute_pending(app)
+    blocker: str | None = None
+    if not pending:
+        pending, blocker = await _advance_steps(app, model)
+
+    report.filled = list(app.filled)
+    report.final_url = page.url
+    if blocker:
+        report.status = "needs_manual"
+        report.blocker_reason = blocker
+    elif pending:
+        report.needs_input = [_needs_input(field_info) for field_info in pending]
+        report.status = "needs_input"
+        report.blocker_reason = f"{ai_note} {_PENDING_REASON}" if ai_note else _PENDING_REASON
+    else:
+        if await _submission_detected(app):
+            _mark_finished(app, "submitted")
+            await _shutdown_application(app)
+            return
+        report.needs_input = []
+        report.status = "review_ready"
+        report.blocker_reason = ai_note
+        _mark_review_run(
+            app.session_id,
+            app.job_id,
+            {(urlsplit(page.url).hostname or "").casefold()},
+        )
+    report.awaiting_user = True
+    report.session_open = True
+    if report.screenshot_path:
+        try:
+            await page.screenshot(path=report.screenshot_path, full_page=True)
+        except Exception:
+            pass
+
+
+async def get_application_status(
+    session_id: str, job_id: str
+) -> AutofillReport | None:
+    """Poll an open application: detects a user-submitted form and refreshes pending fields."""
+    key = (session_id, job_id)
+    app = _OPEN_APPLICATIONS.get(key)
+    if app is None:
+        finished = _FINISHED_REPORTS.get(key)
+        return finished.model_copy(deep=True) if finished is not None else None
+    if app.lock.locked():
+        return app.report.model_copy(deep=True)
+    async with app.lock:
+        if _OPEN_APPLICATIONS.get(key) is not app:
+            return app.report.model_copy(deep=True)
+        _touch(app)
+        try:
+            if app.page.is_closed():
+                _mark_finished(app, "needs_manual", _CLOSED_REASON)
+                await _shutdown_application(app)
+            elif await _submission_detected(app):
+                _mark_finished(app, "submitted")
+                await _shutdown_application(app)
+            elif app.fields:
+                pending = await _recompute_pending(app)
+                app.report.needs_input = [_needs_input(item) for item in pending]
+                if pending:
+                    app.report.status = "needs_input"
+                    app.report.blocker_reason = _PENDING_REASON
+                elif app.report.status == "needs_input":
+                    app.report.status = "review_ready"
+                    app.report.blocker_reason = None
+        except Exception as exc:
+            logger.info("autofill status refresh failed: %s", type(exc).__name__)
+        return app.report.model_copy(deep=True)
+
+
+async def submit_application(
+    session_id: str,
+    job_id: str,
+    *,
+    real_apply_enabled: bool | None = None,
+) -> AutofillReport:
+    """Click the final Submit button of an open application.
+
+    Call this only after the user has confirmed in chat. It refuses unless the run was
+    started with mode="submit" and real applying is enabled, and it never submits while
+    required answers are missing. The five-per-hour session cap still applies.
+    """
+    key = (session_id, job_id)
+    app = _OPEN_APPLICATIONS.get(key)
+    if app is None:
+        finished = _FINISHED_REPORTS.get(key)
+        if finished is not None:
+            return finished.model_copy(deep=True)
+        return AutofillReport(
+            status="failed",
+            blocker_reason="No open application was found for this session. Start it again.",
+        )
+    if real_apply_enabled is None:
+        real_apply_enabled = get_settings().real_apply_enabled
+    async with app.lock:
+        if _OPEN_APPLICATIONS.get(key) is not app:
+            return app.report.model_copy(deep=True)
+        _touch(app)
+        report = app.report
+        try:
+            if app.page.is_closed():
+                _mark_finished(app, "needs_manual", _CLOSED_REASON)
+                await _shutdown_application(app)
+                return report.model_copy(deep=True)
+            if await _submission_detected(app):
+                _mark_finished(app, "submitted")
+                await _shutdown_application(app)
+                return report.model_copy(deep=True)
+            if app.mode != "submit" or not real_apply_enabled:
+                report.blocker_reason = (
+                    "Submitting from chat needs submit mode with real applying enabled. "
+                    "Click Submit yourself in the open browser."
+                )
+                return report.model_copy(deep=True)
+            await _refresh_fields(app)
+            pending = await _recompute_pending(app)
+            if pending:
+                report.needs_input = [_needs_input(item) for item in pending]
+                report.status = "needs_input"
+                report.blocker_reason = _PENDING_REASON
+                return report.model_copy(deep=True)
+            limit_reason = await _reserve_submission(session_id)
+            if limit_reason:
+                report.status = "retry_later"
+                report.blocker_reason = limit_reason
+                return report.model_copy(deep=True)
+            submit = await _submit_button(app.fields)
+            if submit is None:
+                report.status = "needs_manual"
+                report.blocker_reason = (
+                    "No final submit button was found on this step. "
+                    "Click Submit yourself in the open browser."
+                )
+                return report.model_copy(deep=True)
+            await submit.click(timeout=ACTION_TIMEOUT_MS)
+            await app.page.wait_for_timeout(1_500)
+            report.final_url = app.page.url
+            if await _submission_detected(app):
+                _mark_finished(app, "submitted")
+                await asyncio.sleep(_SUBMITTED_CLOSE_DELAY_SECONDS)
+                await _shutdown_application(app)
+                return report.model_copy(deep=True)
+            # Not confirmed yet (validation error, slow page). The window stays open and
+            # the background watcher will still catch a late confirmation.
+            report.status = "needs_manual"
+            report.blocker_reason = (
+                "Submission could not be confirmed yet. Check the open browser window."
+            )
+        except Exception as exc:
+            logger.warning("autofill submit failed: %s", type(exc).__name__)
+            report.status = "needs_manual"
+            report.blocker_reason = (
+                f"The submit click could not be completed ({type(exc).__name__}). "
+                "Check the open browser window."
+            )
+        return report.model_copy(deep=True)
+
+
 async def fill_application_form(
     url: str,
     profile: ResumeProfile,
@@ -1262,6 +1981,7 @@ async def fill_application_form(
     approved_cover_letter: str | None = None,
     review_submit_exemption: bool = False,
     keep_open: bool = False,
+    keep_session: bool = True,
     on_report: Callable[[AutofillReport], None] | None = None,
 ) -> AutofillReport:
     parsed_url = urlsplit(url)
@@ -1306,6 +2026,22 @@ async def fill_application_form(
             blocker_reason="The session or job identifier is not a safe file name.",
             final_url=url,
         )
+    # Keeping the browser open for the user needs a visible window, and is skipped
+    # for the blocking keep_open/input() flow.
+    park_enabled = keep_session and headed and not keep_open
+    if park_enabled:
+        # Re-running the same job replaces its old open window.
+        await close_application(session_id, job.id)
+        if len(_OPEN_APPLICATIONS) >= MAX_OPEN_APPLICATIONS:
+            return AutofillReport(
+                status="retry_later",
+                blocker_reason=(
+                    f"{MAX_OPEN_APPLICATIONS} applications are already open. "
+                    "Finish or cancel one before starting another."
+                ),
+                final_url=url,
+                detected_ats=_detected_ats(url),
+            )
     rate_reason = await _reserve_run(
         hostname.casefold(),
         session_id,
@@ -1326,6 +2062,12 @@ async def fill_application_form(
     browser = None
     page = None
     submit_clicked = False
+    parked = False
+    errored = False
+    fields: list[FormField] = []
+    all_filled: list[FilledField] = []
+    form_identity: tuple[str, str] | None = None
+    step = 0
     reserved_domains = {hostname.casefold()}
     report = AutofillReport(status="failed", final_url=url)
     try:
@@ -1363,11 +2105,10 @@ async def fill_application_form(
                     report.blocker_reason = rate_reason
                     return report
                 reserved_domains.add(final_host)
-            all_filled: list[FilledField] = []
             all_needs_input: list[NeedsInputField] = []
             form_identity = (fields[0].frame.url, fields[0].form_key)
             form_fields_seen = list(fields)
-            for step in range(8):
+            for step in range(MAX_FORM_STEPS):
                 mapping = await _field_mapping(fields, model)
                 filled, missing = await _fill_fields(
                     fields,
@@ -1384,6 +2125,10 @@ async def fill_application_form(
                 for item in all_needs_input:
                     unique_missing[(item.label, item.type)] = item
                 all_needs_input = list(unique_missing.values())
+                # Required answers are missing: clicking Next would only fail validation
+                # and re-type the step. Stop here and keep the window open for the user.
+                if park_enabled and any(item.required for item in all_needs_input):
+                    break
                 next_control = await _next_button(fields)
                 if next_control is None:
                     break
@@ -1467,12 +2212,14 @@ async def fill_application_form(
             report.blocker_reason = "Submission could not be confirmed; please verify manually."
             return report
     except TimeoutError:
+        errored = True
         report.status = "retry_later"
         report.blocker_reason = "The application page timed out; please verify manually."
         if page is not None:
             report.final_url = page.url
         return report
     except Exception as exc:
+        errored = True
         exception_name = type(exc).__name__
         exception_message = str(exc).casefold()
         transient_browser_error = exception_name in {
@@ -1519,6 +2266,34 @@ async def fill_application_form(
                     session_id=session_id,
                     job_id=job.id,
                 )
+            if (
+                park_enabled
+                and not errored
+                and report.status in _PARKABLE_STATUSES
+                and playwright is not None
+                and browser is not None
+                and page is not None
+            ):
+                # Leave the window open for the user instead of closing it below.
+                await _park_application(
+                    session_id=session_id,
+                    job=job,
+                    playwright=playwright,
+                    browser=browser,
+                    page=page,
+                    fields=fields,
+                    form_identity=form_identity,
+                    filled=all_filled,
+                    profile=profile,
+                    answers=answers,
+                    resume_path=resume_path,
+                    approved_cover_letter=approved_cover_letter,
+                    mode=mode,
+                    uploads_dir=uploads_dir,
+                    report=report,
+                    steps_used=step,
+                )
+                parked = True
             if keep_open:
                 if on_report is not None:
                     on_report(report)
@@ -1528,7 +2303,7 @@ async def fill_application_form(
                     except EOFError:
                         pass
         finally:
-            if browser is not None:
+            if browser is not None and not parked:
                 try:
                     await browser.close()
                 except Exception as exc:
@@ -1536,7 +2311,7 @@ async def fill_application_form(
                     if report.status not in {"submitted", "review_ready", "needs_input"}:
                         report.status = "retry_later"
                         report.blocker_reason = "The browser could not close cleanly; try again later."
-            if playwright is not None:
+            if playwright is not None and not parked:
                 try:
                     await playwright.stop()
                 except Exception as exc:

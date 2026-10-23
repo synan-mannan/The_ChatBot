@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     groq_model: str = "llama-3.3-70b-versatile"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
-    real_apply_enabled: bool = False
+    real_apply_enabled: bool = True
     require_review: bool = False
     smtp_host: str = ""
     smtp_port: int = 587
