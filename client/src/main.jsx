@@ -325,17 +325,32 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const fileInput = useRef(null);
+  const messageInput = useRef(null);
   const endOfMessages = useRef(null);
 
   useEffect(() => {
     endOfMessages.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, busy]);
 
+  function resetMessageInputHeight() {
+    if (!messageInput.current) return;
+    messageInput.current.style.height = "auto";
+    messageInput.current.style.overflowY = "hidden";
+  }
+
+  function resizeMessageInput(textarea) {
+    textarea.style.height = "auto";
+    const maxHeight = 200;
+    textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+  }
+
   async function sendMessage(text = input) {
     const messageText = text.trim();
     if (!messageText || busy) return;
     setError("");
     setInput("");
+    resetMessageInputHeight();
     setMessages((current) => [...current, {
       id: crypto.randomUUID(),
       role: "user",
@@ -457,6 +472,7 @@ function App() {
         content: "Hi, I’m **AIJob**. Upload your resume and I’ll help you find roles that fit, refine your search, and keep track of applications."
       }]);
       setInput("");
+      resetMessageInputHeight();
     } catch (requestError) {
       setError(requestError.message);
     } finally {
@@ -542,10 +558,20 @@ function App() {
               aria-label="Upload resume"
               title="Upload resume (PDF or DOCX)"
             >＋</button>
-            <input
+            <textarea
+              ref={messageInput}
               className="message-input"
+              rows={1}
               value={input}
-              onChange={(event) => setInput(event.target.value)}
+              onChange={(event) => {
+                setInput(event.target.value);
+                resizeMessageInput(event.target);
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+                event.preventDefault();
+                sendMessage();
+              }}
               placeholder="Ask about your next opportunity..."
               aria-label="Message AIJob"
               disabled={busy}

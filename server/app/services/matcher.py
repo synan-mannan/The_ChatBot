@@ -108,7 +108,7 @@ def recommend_jobs(
     jobs: list[Job],
     profile: ResumeProfile,
     filters: JobFilters | None = None,
-    top_k: int = 5,
+    top_k: int = 10,
     profile_location: str | None = None,
 ) -> list[JobRecommendation]:
     active_filters = filters or JobFilters()

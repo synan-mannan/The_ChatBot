@@ -1976,7 +1976,7 @@ async def fill_application_form(
     uploads_dir: str = "uploads",
     model: Any | None = None,
     real_apply_enabled: bool | None = None,
-    headed: bool = False,
+    headed: bool = True,
     slow_mo_ms: int = 0,
     approved_cover_letter: str | None = None,
     review_submit_exemption: bool = False,
@@ -2076,7 +2076,7 @@ async def fill_application_form(
         async with asyncio.timeout(300 if headed else FORM_TIMEOUT_SECONDS):
             playwright = await async_playwright().start()
             browser = await playwright.chromium.launch(
-                headless= headed,
+                headless= not headed,
                 slow_mo=slow_mo_ms if headed else 0,
             )
             page = await browser.new_page()
