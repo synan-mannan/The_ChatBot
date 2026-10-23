@@ -1334,7 +1334,7 @@ async def fill_application_form(
         async with asyncio.timeout(300 if headed else FORM_TIMEOUT_SECONDS):
             playwright = await async_playwright().start()
             browser = await playwright.chromium.launch(
-                headless=not headed,
+                headless= headed,
                 slow_mo=slow_mo_ms if headed else 0,
             )
             page = await browser.new_page()
