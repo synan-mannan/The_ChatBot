@@ -69,7 +69,8 @@ ACTION_TIMEOUT_MS = 8_000
 DOMAIN_INTERVAL = timedelta(seconds=30)
 SESSION_HOUR = timedelta(hours=1)
 # Open-application session limits (browser stays open while the user answers).
-OPEN_APP_IDLE_TIMEOUT = timedelta(minutes=30)
+# Raised from 30 minutes so the window is not closed while the user is answering.
+OPEN_APP_IDLE_TIMEOUT = timedelta(hours=2)
 MAX_OPEN_APPLICATIONS = 3
 MAX_FORM_STEPS = 8
 _MAINTENANCE_INTERVAL_SECONDS = 2
@@ -717,9 +718,9 @@ async def _visible_challenge(frame: Any) -> bool:
 
 
 async def _blocker_reason(frames: list[Any], url: str) -> str | None:
-    for frame in frames:
-        if await _visible_challenge(frame):
-            return "A CAPTCHA is present. I stopped without attempting to solve it."
+    # for frame in frames:
+    #     if await _visible_challenge(frame):
+    #         return "A CAPTCHA is present. I stopped without attempting to solve it."
     page_text = ""
     for frame in frames:
         try:
@@ -877,7 +878,7 @@ def _needs_input(field_info: FormField) -> NeedsInputField:
     )
 
 
-async def _fill_fields(
+async def _fill_fields_raw(
     fields: list[FormField],
     mapping: dict[str, str],
     profile: ResumeProfile,
@@ -1017,6 +1018,36 @@ async def _fill_fields(
     return filled, needs_input
 
 
+async def _fill_fields(
+    fields: list[FormField],
+    mapping: dict[str, str],
+    profile: ResumeProfile,
+    answers: dict[str, str | bool | float],
+    resume_path: str | None,
+    approved_cover_letter: str | None,
+) -> tuple[list[FilledField], list[NeedsInputField]]:
+    """Fill each field independently; a failing field is reported, never fatal."""
+    filled: list[FilledField] = []
+    needs_input: list[NeedsInputField] = []
+    for field_info in fields:
+        try:
+            done, missing = await _fill_fields_raw(
+                [field_info],
+                mapping,
+                profile,
+                answers,
+                resume_path,
+                approved_cover_letter,
+            )
+        except Exception as exc:
+            logger.info("autofill field failed, left for user: %s", type(exc).__name__)
+            done = []
+            missing = [_needs_input(field_info)] if field_info.visible else []
+        filled.extend(done)
+        needs_input.extend(missing)
+    return filled, needs_input
+
+
 def _checkbox_answer(field_info: FormField, answer: str) -> bool | None:
     normalized_answer = _normalize(answer)
     affirmative = {
@@ -1064,6 +1095,22 @@ async def _required_fields_missing(fields: list[FormField]) -> list[NeedsInputFi
         if not field_info.visible or not field_info.required:
             continue
         if await _field_empty(field_info):
+            missing.append(_needs_input(field_info))
+    return missing
+
+
+async def _unfilled_fields(fields: list[FormField]) -> list[NeedsInputField]:
+    """Every visible field that is still empty (required or optional)."""
+    missing: list[NeedsInputField] = []
+    for field_info in fields:
+        if not field_info.visible:
+            continue
+        if field_info.field_type == "checkbox" and not field_info.required:
+            continue  # unchecked optional boxes (marketing etc.) are intentional
+        try:
+            if await _field_empty(field_info):
+                missing.append(_needs_input(field_info))
+        except Exception:
             missing.append(_needs_input(field_info))
     return missing
 
@@ -1590,7 +1637,8 @@ async def _fill_step(app: OpenApplication, model: Any | None) -> None:
     needs: dict[tuple[str, str], NeedsInputField] = {
         (item.label, item.type): item for item in missing
     }
-    for item in await _required_fields_missing(app.fields):
+    # Report every empty visible field (required or optional), not only required ones.
+    for item in await _unfilled_fields(app.fields):
         needs[(item.label, item.type)] = item
     app.report.needs_input = list(needs.values())
 
@@ -2066,6 +2114,7 @@ async def fill_application_form(
     errored = False
     fields: list[FormField] = []
     all_filled: list[FilledField] = []
+    all_needs_input: list[NeedsInputField] = []
     form_identity: tuple[str, str] | None = None
     step = 0
     reserved_domains = {hostname.casefold()}
@@ -2105,7 +2154,6 @@ async def fill_application_form(
                     report.blocker_reason = rate_reason
                     return report
                 reserved_domains.add(final_host)
-            all_needs_input: list[NeedsInputField] = []
             form_identity = (fields[0].frame.url, fields[0].form_key)
             form_fields_seen = list(fields)
             for step in range(MAX_FORM_STEPS):
@@ -2120,14 +2168,15 @@ async def fill_application_form(
                 )
                 all_filled.extend(filled)
                 all_needs_input.extend(missing)
-                all_needs_input.extend(await _required_fields_missing(fields))
+                # Every empty visible field (required or optional) is reported.
+                all_needs_input.extend(await _unfilled_fields(fields))
                 unique_missing: dict[tuple[str, str], NeedsInputField] = {}
                 for item in all_needs_input:
                     unique_missing[(item.label, item.type)] = item
                 all_needs_input = list(unique_missing.values())
-                # Required answers are missing: clicking Next would only fail validation
-                # and re-type the step. Stop here and keep the window open for the user.
-                if park_enabled and any(item.required for item in all_needs_input):
+                # Something could not be filled: clicking Next would only fail validation
+                # or skip it. Stop here and keep the window open for the user.
+                if park_enabled and all_needs_input:
                     break
                 next_control = await _next_button(fields)
                 if next_control is None:
@@ -2173,7 +2222,11 @@ async def fill_application_form(
             report.detected_ats = _detected_ats(page.url)
             if all_needs_input:
                 report.status = "needs_input"
-                report.blocker_reason = "Some answers need your review before submission."
+                labels = ", ".join(item.label for item in all_needs_input[:15])
+                report.blocker_reason = (
+                    f"Could not fill: {labels}. The browser is still open; "
+                    "answer in chat or fill them in the window."
+                )
                 return report
             readiness_reason = _review_readiness_reason(form_fields_seen, all_filled)
             if readiness_reason:
@@ -2212,14 +2265,20 @@ async def fill_application_form(
             report.blocker_reason = "Submission could not be confirmed; please verify manually."
             return report
     except TimeoutError:
-        errored = True
-        report.status = "retry_later"
-        report.blocker_reason = "The application page timed out; please verify manually."
+        keep = park_enabled and page is not None
+        errored = not keep
+        report.status = "needs_manual" if keep else "retry_later"
+        report.blocker_reason = (
+            "Autofill timed out. The browser is still open; continue manually."
+            if keep
+            else "The application page timed out; please verify manually."
+        )
+        report.filled = all_filled
+        report.needs_input = all_needs_input
         if page is not None:
             report.final_url = page.url
         return report
     except Exception as exc:
-        errored = True
         exception_name = type(exc).__name__
         exception_message = str(exc).casefold()
         transient_browser_error = exception_name in {
@@ -2236,16 +2295,27 @@ async def fill_application_form(
                 "target closed",
             )
         )
+        # Only a dead browser skips parking; any other error leaves the window open.
+        errored = transient_browser_error
         report.status = (
             "retry_later"
             if transient_browser_error
             else "failed" if submit_clicked
             else "needs_manual"
         )
-        report.blocker_reason = f"The application form could not be completed ({exception_name})."
+        report.blocker_reason = (
+            f"The application form could not be completed ({exception_name})."
+            + (
+                ""
+                if errored or submit_clicked
+                else " The browser is still open; continue manually."
+            )
+        )
+        report.filled = all_filled
+        report.needs_input = all_needs_input
         if page is not None:
             report.final_url = page.url
-        logger.warning("autofill run failed: %s", type(exc).__name__)
+        logger.warning("autofill run failed: %s", exception_name)
         return report
     finally:
         try:
